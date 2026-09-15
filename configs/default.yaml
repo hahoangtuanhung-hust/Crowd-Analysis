@@ -1,0 +1,57 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  upload_directory: data/uploads
+  max_upload_mb: 500
+  jpeg_quality: 82
+  websocket_interval_ms: 250
+  cors_origins:
+    - http://localhost:5173
+
+detector:
+  provider: ultralytics
+  model: yolo26n.pt
+  imgsz: 960
+  confidence: 0.15
+  iou: 0.60
+  max_det: 1000
+  classes: [0]
+  device: auto
+  precision: fp32
+
+tracker:
+  type: bytetrack
+  track_high_thresh: 0.25
+  track_low_thresh: 0.05
+  new_track_thresh: 0.20
+  track_buffer: 60
+  match_thresh: 0.95
+  fuse_score: true
+
+video:
+  inference_interval: 1
+  queue_size: 4
+  stale_frame_policy: drop_oldest
+  reconnect_initial_seconds: 1.0
+  reconnect_max_seconds: 30.0
+
+analytics:
+  grid_width: 64
+  grid_height: 36
+  trajectory_history_points: 120
+  trajectory_smoothing_alpha: 0.35
+  min_confirmed_points: 3
+  max_active_tracks: 2048
+  inactive_track_ttl_seconds: 10.0
+  movement_threshold_pixels: 3.0
+  max_movement_step_pixels: 250.0
+  max_point_gap_seconds: 2.0
+  current_window_seconds: 10
+  live_retention_seconds: 300
+  gaussian_sigma: 1.5
+  path_grid_width: 8
+  path_grid_height: 5
+  max_route_cells: 32
+  max_completed_paths: 2048
+  zone_debounce_points: 2
+  zones: []

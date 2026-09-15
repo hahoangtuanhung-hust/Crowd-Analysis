@@ -1,0 +1,38 @@
+{
+  "coordinate_space": "pixel_space",
+  "image_width": 1920,
+  "image_height": 1080,
+  "provenance": "Manually defined for the fixed Grand Central camera in data.mp4.",
+  "zones": [
+    {
+      "id": "north_west_passage",
+      "name": "North-west passage",
+      "points": [[330, 0], [750, 0], [750, 245], [330, 245]]
+    },
+    {
+      "id": "north_east_passage",
+      "name": "North-east passage",
+      "points": [[1060, 0], [1600, 0], [1600, 255], [1060, 255]]
+    },
+    {
+      "id": "west_concourse",
+      "name": "West concourse",
+      "points": [[0, 250], [360, 250], [360, 900], [0, 900]]
+    },
+    {
+      "id": "central_concourse",
+      "name": "Central concourse",
+      "points": [[360, 245], [1600, 255], [1600, 865], [360, 900]]
+    },
+    {
+      "id": "east_concourse",
+      "name": "East concourse",
+      "points": [[1600, 255], [1920, 255], [1920, 925], [1600, 865]]
+    },
+    {
+      "id": "south_concourse",
+      "name": "South concourse",
+      "points": [[360, 900], [1600, 865], [1920, 1080], [0, 1080]]
+    }
+  ]
+}

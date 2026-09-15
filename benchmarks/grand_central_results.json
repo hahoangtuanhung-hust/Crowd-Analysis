@@ -1,0 +1,20 @@
+{
+  "dataset": "grand-central",
+  "duration": "1m",
+  "duration_seconds": 60.0,
+  "coordinate_mode": "pixel_space",
+  "hardware": {
+    "processor": "Intel64 Family 6 Model 142 Stepping 12, GenuineIntel",
+    "physical_cores": 4,
+    "logical_cores": 8,
+    "ram_gb": 15.8,
+    "gpu": null
+  },
+  "notes": [
+    "All rows were measured on the supplied data.mp4; no values were estimated.",
+    "Ground-truth processing_fps counts sparse annotated frames per second of wall time.",
+    "YOLO processing_fps counts detector frames per second of wall time.",
+    "Blank GPU fields indicate a CPU-only run."
+  ],
+  "csv": "D:\\AITHUCCHIEN\\VinFast\\project-crownd-analysis\\benchmarks\\grand_central_results.csv"
+}

@@ -1,0 +1,4 @@
+mode,detector,tracker,imgsz,inference_interval,processing_fps,inference_ms,tracking_ms,analytics_ms,e2e_ms,cpu_percent,ram_mb,gpu_memory_mb,dropped_frames
+ground_truth_analytics,none,none,,0,210.567,,,4.749,4.749,100.1,128.777,,0
+yolo_bytetrack,yolo26n.pt,bytetrack,640,1,7.671,125.834,3.091,0.076,768.064,621.4,407.297,,0
+yolo_bytetrack,yolo26n.pt,bytetrack,640,2,7.244,132.525,3.093,0.066,400.391,609.2,405.312,,0
