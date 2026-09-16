@@ -71,15 +71,37 @@ Process the full clip with the measured default configuration:
 python -m scripts.process_point_tracks data/videos/data-test.mp4 --zones configs/zones.json
 ```
 
-For a quick functional run, add `--max-frames 300 --output-dir outputs/smoke`. The full command
-writes these files to `outputs/`:
+For a quick functional run, add `--max-frames 300 --output-dir outputs/smoke`. The command
+writes exactly these six artifacts:
 
-- `tracked_points.mp4`: bottom-center points, Track IDs, bounded tails, direction, count, FPS and latency; no person bounding boxes;
-- `trajectories.csv`: confirmed point tracks with `camera_id,track_id,frame_id,timestamp,x,y,zone_id`;
-- `path_map.png`: completed routes and the top entry/exit flows ranked by unique Track ID;
+- `frame_metrics.csv`: per-frame detections, active/new/lost tracks, FPS and inference latency;
 - `heatmap.png`: density accumulated from confirmed track points;
+- `path_map.png`: completed routes and the top entry/exit flows ranked by unique Track ID;
+- `tracked_points.mp4`: bottom-center points, Track IDs, bounded tails, direction, count, FPS and latency;
+- `trajectories.csv`: confirmed point tracks with `camera_id,track_id,frame_id,timestamp,x,y,zone_id`;
 - `zone_flows.json`: measured run summary and deduplicated first-zone to last-zone flows;
-- `benchmark.csv`: the nine detector benchmark rows. Per-frame diagnostics are in `benchmark_frames.csv` and `frame_metrics.csv`.
+
+The Modal entry point uses the same contract and defaults to `data/videos/data-test.mp4`:
+
+```powershell
+modal run modal_app.py --output-dir output_modal
+```
+
+The Shibuya wide-angle view needs the tiled small-person profile. Run it on a GPU because each
+frame includes one full-frame pass plus four overlapping tiles:
+
+```powershell
+$env:PYTHONUTF8="1"
+modal run --quiet --timestamps modal_app.py `
+  --video-path data/videos/data-shibuya-test.mp4 `
+  --pipeline-type points `
+  --config-path configs/shibuya.yaml `
+  --zones-path configs/shibuya-zones.json `
+  --output-dir output_modal/shibuya-sensitive
+```
+
+Use `--max-frames 300` for a short GPU smoke test. The empty Shibuya zone file intentionally
+disables Grand Central polygons; add camera-specific polygons before interpreting zone flows.
 
 `configs/zones.json` uses pixel-space polygons for the fixed 1920x1080 camera. Each zone accepts
 the documented `id`, `name`, and `points` fields. Coordinates are scaled when the input resolution
@@ -100,8 +122,9 @@ Before calibration, spatial results are labeled `pixel` / `Relative`. Calibratio
 
 All thresholds and resource bounds live in [`configs/default.yaml`](configs/default.yaml):
 
-- detector model, resolution, confidence, IoU, maximum detections, classes, device and precision;
-- ByteTrack thresholds, hybrid IoU/point-distance association, and lost-track grace/buffer;
+- detector model, resolution, confidence, IoU, tiled inference, maximum detections, classes,
+  device and precision;
+- ByteTrack thresholds, hybrid IoU/point-distance association, moving/stationary grace and buffer;
 - inference interval, queue size, stale-frame policy and reconnect backoff;
 - trajectory smoothing/history/TTL/cardinality;
 - heatmap grid, time retention, movement threshold and Gaussian sigma;

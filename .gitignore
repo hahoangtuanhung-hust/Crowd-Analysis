@@ -16,6 +16,7 @@ data/uploads/*
 data/outputs/*
 outputs/
 output_modal/
+output_local/
 !data/uploads/.gitkeep
 !data/outputs/.gitkeep
 data/grand-central/raw/
