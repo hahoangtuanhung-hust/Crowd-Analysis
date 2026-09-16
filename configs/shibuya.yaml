@@ -12,34 +12,37 @@ detector:
   provider: ultralytics
   model: yolo26n.pt
   imgsz: 1280
-  confidence: 0.05
-  iou: 0.60
+  confidence: 0.04
+  iou: 0.55
   max_det: 1000
   classes: [0]
   device: auto
   precision: fp32
-  tiled_inference: false
+  tiled_inference: true
   tile_rows: 2
   tile_columns: 2
   tile_overlap: 0.20
   tile_merge_iou: 0.45
   tile_include_full_frame: true
-  ignore_regions: []
+  ignore_regions:
+    - [0.00, 0.04, 0.09, 0.24]
+    - [0.43, 0.04, 0.56, 0.23]
+    - [0.80, 0.04, 0.95, 0.24]
 
 tracker:
   type: bytetrack
-  track_high_thresh: 0.15
-  track_low_thresh: 0.05
-  new_track_thresh: 0.15
-  track_buffer: 120
-  match_thresh: 0.75
+  track_high_thresh: 0.08
+  track_low_thresh: 0.04
+  new_track_thresh: 0.08
+  track_buffer: 180
+  match_thresh: 0.80
   fuse_score: false
   association_mode: hybrid
-  max_center_distance_ratio: 0.045
-  second_match_thresh: 0.65
+  max_center_distance_ratio: 0.04
+  second_match_thresh: 0.70
   lost_track_grace_frames: 8
-  stationary_lost_track_grace_frames: 8
-  stationary_speed_threshold: 3.0
+  stationary_lost_track_grace_frames: 30
+  stationary_speed_threshold: 2.0
   stationary_boost: true
 
 video:
@@ -55,9 +58,9 @@ analytics:
   trajectory_history_points: 150
   trajectory_smoothing_alpha: 0.35
   min_confirmed_points: 3
-  max_active_tracks: 2048
+  max_active_tracks: 4096
   inactive_track_ttl_seconds: 15.0
-  movement_threshold_pixels: 2.5
+  movement_threshold_pixels: 1.5
   max_movement_step_pixels: 250.0
   max_point_gap_seconds: 2.0
   current_window_seconds: 10
@@ -66,11 +69,11 @@ analytics:
   path_grid_width: 8
   path_grid_height: 5
   max_route_cells: 32
-  max_completed_paths: 2048
+  max_completed_paths: 4096
   zone_debounce_points: 2
   ddcrp_enabled: true
   ddcrp_alpha: 0.4
   ddcrp_spatial_scale: 75.0
   ddcrp_direction_weight: 0.6
-  ddcrp_stationary_threshold: 18.0
+  ddcrp_stationary_threshold: 12.0
   zones: []

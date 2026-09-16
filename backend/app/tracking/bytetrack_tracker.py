@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -154,17 +155,38 @@ class ByteTrackTracker:
             class_ids=np.asarray([item.class_id for item in detections], dtype=np.float32),
         )
         tracked = self._tracker.update(results, img=frame)
+
+        # Damp Kalman filter velocity for stationary pedestrians (e.g. buying tickets, queues)
+        # to prevent bounding box drift when partially occluded or standing still.
+        if getattr(self._config, "stationary_boost", True):
+            for strack in getattr(self._tracker, "tracked_stracks", []):
+                if hasattr(strack, "mean") and len(strack.mean) >= 6:
+                    vx, vy = float(strack.mean[4]), float(strack.mean[5])
+                    if math.hypot(vx, vy) < self._config.stationary_speed_threshold:
+                        strack.mean[4] *= 0.1
+                        strack.mean[5] *= 0.1
+
         output = [self._to_tracked_object(row, width, height) for row in tracked]
         visible_ids = {item.track_id for item in output}
 
         if self._config.lost_track_grace_frames:
             for item in self._tracker.lost_stracks:
                 missed_frames = self._tracker.frame_id - item.end_frame
+                grace_frames = self._config.lost_track_grace_frames
+                if (
+                    self._config.stationary_boost
+                    and self._config.stationary_lost_track_grace_frames is not None
+                    and hasattr(item, "mean")
+                    and len(item.mean) >= 6
+                    and math.hypot(float(item.mean[4]), float(item.mean[5]))
+                    < self._config.stationary_speed_threshold
+                ):
+                    grace_frames = self._config.stationary_lost_track_grace_frames
                 if (
                     item.is_activated
                     and item.tracklet_len > 0
                     and item.track_id not in visible_ids
-                    and 0 < missed_frames <= self._config.lost_track_grace_frames
+                    and 0 < missed_frames <= grace_frames
                 ):
                     output.append(self._to_tracked_object(item.result, width, height))
 

@@ -82,3 +82,24 @@ def test_single_frame_detection_is_not_carried_as_a_lost_track() -> None:
 
     assert tracker.update([Detection(30, 40, 80, 180, 0.9)], frame)
     assert tracker.update([], frame) == []
+
+
+def test_stationary_track_uses_longer_grace_period() -> None:
+    tracker = ByteTrackTracker(
+        TrackerConfig(
+            lost_track_grace_frames=1,
+            stationary_lost_track_grace_frames=3,
+            stationary_speed_threshold=2.0,
+        )
+    )
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    detection = Detection(30, 40, 80, 180, 0.9)
+    tracker.update([detection], frame)
+    observed = tracker.update([detection], frame)
+
+    predicted = [tracker.update([], frame) for _ in range(3)]
+    expired = tracker.update([], frame)
+
+    assert all(len(items) == 1 for items in predicted)
+    assert all(items[0].track_id == observed[0].track_id for items in predicted)
+    assert expired == []
