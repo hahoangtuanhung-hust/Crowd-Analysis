@@ -14,10 +14,10 @@ class StrictModel(BaseModel):
 class DetectorConfig(StrictModel):
     provider: Literal["ultralytics"] = "ultralytics"
     model: str = "yolo26n.pt"
-    imgsz: int = Field(default=640, ge=32)
-    confidence: float = Field(default=0.35, ge=0.0, le=1.0)
-    iou: float = Field(default=0.7, ge=0.0, le=1.0)
-    max_det: int = Field(default=300, ge=1)
+    imgsz: int = Field(default=1280, ge=32)
+    confidence: float = Field(default=0.05, ge=0.0, le=1.0)
+    iou: float = Field(default=0.6, ge=0.0, le=1.0)
+    max_det: int = Field(default=1000, ge=1)
     classes: list[int] = Field(default_factory=lambda: [0])
     device: str = "auto"
     precision: Literal["fp32", "fp16"] = "fp32"
@@ -25,17 +25,23 @@ class DetectorConfig(StrictModel):
 
 class TrackerConfig(StrictModel):
     type: Literal["bytetrack"] = "bytetrack"
-    track_high_thresh: float = Field(default=0.25, ge=0.0, le=1.0)
-    track_low_thresh: float = Field(default=0.1, ge=0.0, le=1.0)
-    new_track_thresh: float = Field(default=0.25, ge=0.0, le=1.0)
-    track_buffer: int = Field(default=30, ge=1)
-    match_thresh: float = Field(default=0.8, ge=0.0, le=1.0)
-    fuse_score: bool = True
+    track_high_thresh: float = Field(default=0.15, ge=0.0, le=1.0)
+    track_low_thresh: float = Field(default=0.05, ge=0.0, le=1.0)
+    new_track_thresh: float = Field(default=0.15, ge=0.0, le=1.0)
+    track_buffer: int = Field(default=60, ge=1)
+    match_thresh: float = Field(default=0.75, ge=0.0, le=1.0)
+    fuse_score: bool = False
+    association_mode: Literal["iou", "hybrid"] = "hybrid"
+    max_center_distance_ratio: float = Field(default=0.035, gt=0.0, le=1.0)
+    second_match_thresh: float = Field(default=0.6, ge=0.0, le=1.0)
+    lost_track_grace_frames: int = Field(default=3, ge=0)
 
     @model_validator(mode="after")
     def validate_threshold_order(self) -> TrackerConfig:
         if self.track_low_thresh > self.track_high_thresh:
             raise ValueError("track_low_thresh must not exceed track_high_thresh")
+        if self.new_track_thresh < self.track_high_thresh:
+            raise ValueError("new_track_thresh must not be below track_high_thresh")
         return self
 
 
@@ -98,6 +104,15 @@ class AppConfig(StrictModel):
     tracker: TrackerConfig = Field(default_factory=TrackerConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
     analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
+
+    @model_validator(mode="after")
+    def validate_detection_tracking_thresholds(self) -> AppConfig:
+        if self.detector.confidence > self.tracker.track_low_thresh:
+            raise ValueError(
+                "detector.confidence must not exceed tracker.track_low_thresh; "
+                "otherwise ByteTrack cannot use its low-confidence recovery stage"
+            )
+        return self
 
 
 def load_config(path: str | Path) -> AppConfig:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -37,12 +38,105 @@ class _DetectionResults:
 class ByteTrackTracker:
     def __init__(self, config: TrackerConfig) -> None:
         self._config = config
+        self._frame_diagonal = 1.0
         self._tracker = self._create_tracker()
 
     def _create_tracker(self):
+        from ultralytics.trackers.basetrack import TrackState
         from ultralytics.trackers.byte_tracker import BYTETracker
+        from ultralytics.trackers.utils import matching
 
-        return BYTETracker(SimpleNamespace(**self._config.model_dump()))
+        owner = self
+
+        class CrowdBYTETracker(BYTETracker):
+            """ByteTrack with point-distance association for distant pedestrians."""
+
+            def get_dists(self, tracks: list[Any], detections: list[Any]) -> NDArray:
+                return owner._association_cost(
+                    tracks,
+                    detections,
+                    fuse_score=self.args.fuse_score,
+                )
+
+            def _second_association(
+                self,
+                strack_pool: list[Any],
+                u_track: list[int],
+                detections_second: list[Any],
+                activated: list[Any],
+                refind: list[Any],
+                lost: list[Any],
+            ) -> None:
+                remaining = [
+                    strack_pool[index]
+                    for index in u_track
+                    if strack_pool[index].state == TrackState.Tracked
+                ]
+                if remaining and detections_second:
+                    dists = owner._association_cost(
+                        remaining,
+                        detections_second,
+                        fuse_score=False,
+                    )
+                    matches, unmatched, _ = matching.linear_assignment(
+                        dists,
+                        thresh=owner._config.second_match_thresh,
+                    )
+                    self._apply_matches(
+                        matches,
+                        remaining,
+                        detections_second,
+                        activated,
+                        refind,
+                    )
+                else:
+                    unmatched = list(range(len(remaining)))
+
+                for index in unmatched:
+                    track = remaining[index]
+                    if track.state != TrackState.Lost:
+                        track.mark_lost()
+                        lost.append(track)
+
+        return CrowdBYTETracker(SimpleNamespace(**self._config.model_dump()))
+
+    def _association_cost(
+        self,
+        tracks: list[Any],
+        detections: list[Any],
+        *,
+        fuse_score: bool,
+    ) -> NDArray[np.float32]:
+        from ultralytics.trackers.utils import matching
+
+        cost = np.asarray(matching.iou_distance(tracks, detections), dtype=np.float32)
+        if self._config.association_mode == "hybrid" and tracks and detections:
+            track_points = np.asarray(
+                [self._bottom_center(item.xyxy) for item in tracks],
+                dtype=np.float32,
+            )
+            detection_points = np.asarray(
+                [self._bottom_center(item.xyxy) for item in detections],
+                dtype=np.float32,
+            )
+            distances = np.linalg.norm(
+                track_points[:, None, :] - detection_points[None, :, :],
+                axis=2,
+            )
+            maximum = max(
+                1.0,
+                self._frame_diagonal * self._config.max_center_distance_ratio,
+            )
+            center_cost = np.clip(distances / maximum, 0.0, 1.0).astype(np.float32)
+            cost = np.minimum(cost, center_cost)
+
+        if fuse_score:
+            cost = np.asarray(matching.fuse_score(cost, detections), dtype=np.float32)
+        return cost
+
+    @staticmethod
+    def _bottom_center(xyxy: NDArray) -> tuple[float, float]:
+        return (float(xyxy[0]) + float(xyxy[2])) / 2.0, float(xyxy[3])
 
     def reset(self) -> None:
         self._tracker = self._create_tracker()
@@ -52,24 +146,38 @@ class ByteTrackTracker:
         detections: Sequence[Detection],
         frame: NDArray[np.uint8],
     ) -> list[TrackedObject]:
+        height, width = frame.shape[:2]
+        self._frame_diagonal = float(np.hypot(width, height))
         results = _DetectionResults(
             xyxy=np.asarray([item.xyxy for item in detections], dtype=np.float32),
             confidence=np.asarray([item.confidence for item in detections], dtype=np.float32),
             class_ids=np.asarray([item.class_id for item in detections], dtype=np.float32),
         )
         tracked = self._tracker.update(results, img=frame)
-        if tracked.size == 0:
-            return []
+        output = [self._to_tracked_object(row, width, height) for row in tracked]
+        visible_ids = {item.track_id for item in output}
 
-        return [
-            TrackedObject(
-                x1=float(row[0]),
-                y1=float(row[1]),
-                x2=float(row[2]),
-                y2=float(row[3]),
-                track_id=int(row[4]),
-                confidence=float(row[5]),
-                class_id=int(row[6]),
-            )
-            for row in tracked
-        ]
+        if self._config.lost_track_grace_frames:
+            for item in self._tracker.lost_stracks:
+                missed_frames = self._tracker.frame_id - item.end_frame
+                if (
+                    item.is_activated
+                    and item.tracklet_len > 0
+                    and item.track_id not in visible_ids
+                    and 0 < missed_frames <= self._config.lost_track_grace_frames
+                ):
+                    output.append(self._to_tracked_object(item.result, width, height))
+
+        return sorted(output, key=lambda item: item.track_id)
+
+    @staticmethod
+    def _to_tracked_object(row: Sequence[float], width: int, height: int) -> TrackedObject:
+        return TrackedObject(
+            x1=float(np.clip(row[0], 0, width - 1)),
+            y1=float(np.clip(row[1], 0, height - 1)),
+            x2=float(np.clip(row[2], 0, width - 1)),
+            y2=float(np.clip(row[3], 0, height - 1)),
+            track_id=int(row[4]),
+            confidence=float(row[5]),
+            class_id=int(row[6]),
+        )

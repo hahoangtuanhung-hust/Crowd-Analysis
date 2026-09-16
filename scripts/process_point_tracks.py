@@ -30,7 +30,7 @@ FRAME_FIELDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create point-only tracks and entry/exit maps")
-    parser.add_argument("source", nargs="?", default="data/videos/data.mp4")
+    parser.add_argument("source", nargs="?", default="data/videos/data-test.mp4")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--zones", default="configs/zones.json")
     parser.add_argument("--output-dir", default="outputs")

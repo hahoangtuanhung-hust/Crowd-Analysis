@@ -58,17 +58,17 @@ Outputs are written to `data/outputs/`: overlay MP4, track JSONL, occupancy/move
 
 ## Point-only tracking and route maps
 
-Benchmark the real Grand Central clip across `imgsz=640/960/1280` and
-`confidence=0.15/0.20/0.25`:
+Benchmark the test clip across `imgsz=640/960/1280` and
+`confidence=0.05/0.10/0.15`:
 
 ```powershell
-python -m scripts.benchmark_tracking data/videos/data.mp4 --max-frames 150
+python -m scripts.benchmark_tracking data/videos/data-test.mp4 --max-frames 150
 ```
 
 Process the full clip with the measured default configuration:
 
 ```powershell
-python -m scripts.process_point_tracks data/videos/data.mp4 --zones configs/zones.json
+python -m scripts.process_point_tracks data/videos/data-test.mp4 --zones configs/zones.json
 ```
 
 For a quick functional run, add `--max-frames 300 --output-dir outputs/smoke`. The full command
@@ -101,17 +101,21 @@ Before calibration, spatial results are labeled `pixel` / `Relative`. Calibratio
 All thresholds and resource bounds live in [`configs/default.yaml`](configs/default.yaml):
 
 - detector model, resolution, confidence, IoU, maximum detections, classes, device and precision;
-- ByteTrack thresholds and lost-track buffer;
+- ByteTrack thresholds, hybrid IoU/point-distance association, and lost-track grace/buffer;
 - inference interval, queue size, stale-frame policy and reconnect backoff;
 - trajectory smoothing/history/TTL/cardinality;
 - heatmap grid, time retention, movement threshold and Gaussian sigma;
 - route grid/cardinality, zone debounce, upload/JPEG/WebSocket settings.
 
-The measured `data.mp4` default is YOLO26n + ByteTrack, class `person`, `imgsz=960`, confidence
-`0.15`, `max_det=1000`, inference interval 1, and a 60-frame lost-track buffer. On the local CPU,
-960/0.15 was the fastest benchmark candidate above 3 FPS with the highest active-track count;
-1280 detected more distant people but ran at about 2.3 FPS. These are PoC measurements, not a claim
-that the defaults are universally best. Ultralytics licensing is AGPL-3.0 or Enterprise;
+The `data-test.mp4` default is YOLO26n + ByteTrack, class `person`, `imgsz=1280`, detector
+confidence `0.05`, new-track confidence `0.15`, and inference interval 1. Low-confidence boxes
+can recover existing tracks but cannot start new ones. Hybrid IoU/bottom-center association handles
+the large apparent step between adjacent time-lapse frames, while a three-frame grace keeps a
+confirmed stationary person visible through a short detector miss. In a 30-frame local CPU
+regression, active tracks increased from 11.2 to 62.3 per frame; throughput decreased from 5.34 to
+3.05 FPS. A full 1,804-frame run averaged 74.8 active tracks and peaked at 103 at 2.39 CPU FPS.
+These are PoC measurements, not a claim that all people can be recovered in every scene.
+Ultralytics licensing is AGPL-3.0 or Enterprise;
 proprietary distribution requires legal review, an Enterprise license, or a detector with
 compatible terms.
 

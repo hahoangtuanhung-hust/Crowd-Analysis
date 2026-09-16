@@ -10,7 +10,7 @@ from pathlib import Path
 
 import cv2
 
-from backend.app.core.config import TrackerConfig, load_config
+from backend.app.core.config import load_config
 from backend.app.datasets.grand_central import GrandCentralDataset
 from backend.app.inference import UltralyticsPersonDetector
 from backend.app.schemas import Detection
@@ -19,7 +19,7 @@ from backend.app.tracking import ByteTrackTracker
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark YOLO person detection and ByteTrack")
-    parser.add_argument("source", nargs="?", default="data/videos/data.mp4")
+    parser.add_argument("source", nargs="?", default="data/videos/data-test.mp4")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--output", default="outputs/benchmark.csv")
     parser.add_argument("--frame-log", default="outputs/benchmark_frames.csv")
@@ -88,7 +88,7 @@ def main() -> int:
     frame_rows: list[dict[str, object]] = []
     summary_rows: list[dict[str, object]] = []
     for imgsz in (640, 960, 1280):
-        for confidence in (0.15, 0.20, 0.25):
+        for confidence in (0.05, 0.10, 0.15):
             detector = UltralyticsPersonDetector(
                 config.detector.model_copy(
                     update={
@@ -100,16 +100,7 @@ def main() -> int:
                     }
                 )
             )
-            tracker = ByteTrackTracker(
-                TrackerConfig(
-                    track_high_thresh=0.25,
-                    track_low_thresh=0.05,
-                    new_track_thresh=0.20,
-                    track_buffer=60,
-                    match_thresh=0.80,
-                    fuse_score=True,
-                )
-            )
+            tracker = ByteTrackTracker(config.tracker)
             capture = cv2.VideoCapture(str(source))
             previous_ids: set[int] = set()
             seen_ids: set[int] = set()
@@ -166,12 +157,15 @@ def main() -> int:
                     "confidence": confidence,
                     "iou": 0.60,
                     "max_det": 1000,
-                    "track_high_thresh": 0.25,
-                    "track_low_thresh": 0.05,
-                    "new_track_thresh": 0.20,
-                    "track_buffer": 60,
-                    "match_thresh": 0.80,
-                    "fuse_score": True,
+                    "track_high_thresh": config.tracker.track_high_thresh,
+                    "track_low_thresh": config.tracker.track_low_thresh,
+                    "new_track_thresh": config.tracker.new_track_thresh,
+                    "track_buffer": config.tracker.track_buffer,
+                    "match_thresh": config.tracker.match_thresh,
+                    "fuse_score": config.tracker.fuse_score,
+                    "association_mode": config.tracker.association_mode,
+                    "max_center_distance_ratio": config.tracker.max_center_distance_ratio,
+                    "lost_track_grace_frames": config.tracker.lost_track_grace_frames,
                     "raw_detections_per_frame": statistics.fmean(
                         int(row["raw_person_detections"]) for row in measured
                     ),

@@ -11,8 +11,8 @@ server:
 detector:
   provider: ultralytics
   model: yolo26n.pt
-  imgsz: 960
-  confidence: 0.15
+  imgsz: 1280
+  confidence: 0.05
   iou: 0.60
   max_det: 1000
   classes: [0]
@@ -21,12 +21,16 @@ detector:
 
 tracker:
   type: bytetrack
-  track_high_thresh: 0.25
+  track_high_thresh: 0.15
   track_low_thresh: 0.05
-  new_track_thresh: 0.20
+  new_track_thresh: 0.15
   track_buffer: 60
-  match_thresh: 0.95
-  fuse_score: true
+  match_thresh: 0.75
+  fuse_score: false
+  association_mode: hybrid
+  max_center_distance_ratio: 0.035
+  second_match_thresh: 0.60
+  lost_track_grace_frames: 3
 
 video:
   inference_interval: 1
