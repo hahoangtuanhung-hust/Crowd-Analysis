@@ -39,8 +39,8 @@ export function HeatmapPanel({ data, metric, window, onMetricChange, onWindowCha
     <section className="panel spatial-panel">
       <header className="panel-header split-header">
         <div>
-          <p className="eyebrow">Spatial density</p>
-          <h2>{metric === "occupancy" ? "Occupancy heatmap" : "Movement heatmap"}</h2>
+          <p className="eyebrow">Spatial Analysis · Heatmap</p>
+          <h2>{metric === "occupancy" ? "Occupancy Heatmap (Mật độ đứng yên)" : "Movement Heatmap (Vận tốc di chuyển)"}</h2>
         </div>
         <div className="segmented compact" aria-label="Heatmap metric">
           <button type="button" className={metric === "occupancy" ? "selected" : ""} onClick={() => onMetricChange("occupancy")}>Occupancy</button>

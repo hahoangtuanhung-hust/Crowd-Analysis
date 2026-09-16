@@ -51,8 +51,8 @@ export function FlowField({ data }: { data: FlowData | null }) {
   return (
     <section className="panel flow-panel">
       <header className="panel-header split-header">
-        <div><p className="eyebrow">Vector field</p><h2>Movement direction</h2></div>
-        <span className="direction-badge"><Navigation size={15} style={{ transform: `rotate(${directionAngle(direction)}deg)` }} />{direction}</span>
+        <div><p className="eyebrow">Vector field · Pathmap</p><h2>Pathmap (Hướng di chuyển)</h2></div>
+        <span className="direction-badge"><Navigation size={15} style={{ transform: `rotate(${directionAngle(direction)}deg)` }} />Hướng chủ đạo: {direction}</span>
       </header>
       <canvas ref={canvasRef} aria-label={`Movement flow field, dominant direction ${direction}`} />
     </section>
