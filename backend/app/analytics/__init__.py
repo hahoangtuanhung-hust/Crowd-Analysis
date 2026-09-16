@@ -1,3 +1,4 @@
+from .ddcrp import DDCRPClustering
 from .engine import AnalyticsEngine
 from .flow import FlowAnalyzer
 from .heatmap import HeatmapAnalyzer, HeatmapWindow
@@ -14,6 +15,7 @@ from .zones import ZoneAnalyzer
 __all__ = [
     "AnalyticsEngine",
     "CompletedTracklet",
+    "DDCRPClustering",
     "FlowAnalyzer",
     "HeatmapAnalyzer",
     "HeatmapWindow",
@@ -24,3 +26,4 @@ __all__ = [
     "TrajectoryPoint",
     "ZoneAnalyzer",
 ]
+

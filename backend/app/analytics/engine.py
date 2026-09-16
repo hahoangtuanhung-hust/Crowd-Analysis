@@ -5,6 +5,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from backend.app.analytics.ddcrp import DDCRPClustering
 from backend.app.analytics.flow import FlowAnalyzer
 from backend.app.analytics.heatmap import HeatmapAnalyzer, HeatmapWindow
 from backend.app.analytics.spatial import SpatialTransformer
@@ -47,6 +48,13 @@ class AnalyticsEngine:
         self.heatmaps = HeatmapAnalyzer(config, transformer, retain_entire=retain_entire)
         self.flows = FlowAnalyzer(config, transformer, retain_entire=retain_entire)
         self.zones = ZoneAnalyzer(config, transformer, retain_entire=retain_entire)
+        self.ddcrp = DDCRPClustering(
+            config,
+            alpha=config.ddcrp_alpha,
+            spatial_scale=config.ddcrp_spatial_scale,
+            direction_weight=config.ddcrp_direction_weight,
+            stationary_threshold=config.ddcrp_stationary_threshold,
+        )
         self._lock = threading.RLock()
         self._current_count = 0
         self._peak_count = 0
@@ -70,6 +78,8 @@ class AnalyticsEngine:
             self.heatmaps.process(trajectories)
             self.flows.process(trajectories)
             self.zones.process(trajectories)
+            if self.config.ddcrp_enabled:
+                self.ddcrp.observe_all(trajectories)
             self._latest_trajectories = trajectories
 
             self._current_count = len(result.tracks)
@@ -126,7 +136,14 @@ class AnalyticsEngine:
 
     def top_paths(self, limit: int = 5) -> tuple[PopularPath, ...]:
         with self._lock:
+            ddcrp_paths = list(self.ddcrp.top_paths(limit)) if self.config.ddcrp_enabled else []
+            zone_paths = list(self.zones.top_paths(limit))
+            if ddcrp_paths:
+                # Combine DD-CRP pathways (including stationary queues) and zone transitions
+                combined = ddcrp_paths + [p for p in zone_paths if not any(p.label == d.label for d in ddcrp_paths)]
+                return tuple(sorted(combined, key=lambda p: -p.count)[:limit])
             return self.zones.top_paths(limit) or self.flows.top_paths(limit)
+
 
     def timeline(self) -> tuple[TimelinePoint, ...]:
         with self._lock:
