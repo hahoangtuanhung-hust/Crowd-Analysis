@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "dev:replay": "vite --host 0.0.0.0 --mode replay",
     "build": "tsc -b && vite build",
     "lint": "tsc -b --pretty false"
   },
@@ -18,6 +19,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.0",
+    "playwright": "^1.63.0",
     "typescript": "^5.9.0",
     "vite": "^8.3.0"
   }

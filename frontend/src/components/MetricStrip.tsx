@@ -5,9 +5,10 @@ import type { CrowdSummary, PerformanceMetrics } from "../types";
 interface MetricStripProps {
   summary: CrowdSummary;
   metrics: PerformanceMetrics;
+  replayMode?: boolean;
 }
 
-export function MetricStrip({ summary, metrics }: MetricStripProps) {
+export function MetricStrip({ summary, metrics, replayMode = false }: MetricStripProps) {
   const items = [
     { label: "Current", value: summary.current_crowd_count, icon: Users },
     { label: "Average", value: summary.average_crowd_count.toFixed(1), icon: Activity },
@@ -25,8 +26,8 @@ export function MetricStrip({ summary, metrics }: MetricStripProps) {
         ))}
       </section>
       <section className="performance-strip" aria-label="Processing performance">
-        <PerformanceItem label="Processing" value={`${metrics.processing_fps.toFixed(1)} FPS`} />
-        <PerformanceItem label="Inference" value={formatMs(metrics.inference_ms)} />
+        <PerformanceItem label={replayMode ? "Replay" : "Processing"} value={`${metrics.processing_fps.toFixed(1)} FPS`} />
+        <PerformanceItem label="Inference" value={replayMode ? "N/A (cache)" : formatMs(metrics.inference_ms)} />
         <PerformanceItem label="Tracking" value={formatMs(metrics.tracking_ms)} />
         <PerformanceItem label="Analytics" value={formatMs(metrics.analytics_ms)} />
         <PerformanceItem label="p95 latency" value={formatMs(metrics.e2e_latency_ms_p95 ?? metrics.e2e_latency_ms)} />

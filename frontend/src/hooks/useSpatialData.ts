@@ -3,11 +3,12 @@ import { useEffect, useState } from "react";
 import { getFlow, getHeatmap } from "../api";
 import type { FlowData, HeatmapData, HeatmapMetric, TimeWindow } from "../types";
 
-export function useSpatialData(metric: HeatmapMetric, timeWindow: TimeWindow, version: number) {
+export function useSpatialData(metric: HeatmapMetric, timeWindow: TimeWindow, version: number, enabled = true) {
   const [heatmap, setHeatmap] = useState<HeatmapData | null>(null);
   const [flow, setFlow] = useState<FlowData | null>(null);
 
   useEffect(() => {
+    if (!enabled) return;
     const controller = new AbortController();
     const timer = globalThis.window.setTimeout(() => {
       Promise.all([
@@ -26,7 +27,7 @@ export function useSpatialData(metric: HeatmapMetric, timeWindow: TimeWindow, ve
       globalThis.window.clearTimeout(timer);
       controller.abort();
     };
-  }, [metric, timeWindow, Math.floor(version / 2)]);
+  }, [metric, timeWindow, Math.floor(version / 2), enabled]);
 
   return { heatmap, flow };
 }
