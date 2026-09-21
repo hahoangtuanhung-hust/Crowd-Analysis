@@ -48,7 +48,9 @@ image = (
     image=image,
     gpu="T4",               # Có thể chọn: "T4", "A10G", "L4", hoặc bỏ qua nếu chạy CPU
     volumes={"/root/data": volume},
-    timeout=1800,           # 30 phút timeout cho video dài
+    # Shibuya uses one full-frame inference plus four tiles per source frame.
+    # A 200-second clip can exceed 30 minutes, including video finalization and download.
+    timeout=3600,
 )
 def run_tracking_remote(
     video_bytes: bytes,
@@ -154,7 +156,9 @@ def run_tracking_remote(
     volumes={"/root/data": volume},
     timeout=600,
     scaledown_window=300,   # Giữ ấm container 5 phút sau request cuối
+    max_containers=1,       # BẮT BUỘC: Đảm bảo chỉ 1 container duy nhất chạy, giữ đồng bộ bộ nhớ WebSocket và Session
 )
+@modal.concurrent(max_inputs=100)   # Cho phép xử lý đồng thời WebSocket + HTTP requests trong cùng 1 container
 @modal.asgi_app()
 def fastapi_app():
     import sys
@@ -165,6 +169,7 @@ def fastapi_app():
     config = load_config(Path("/root/configs/default.yaml"))
     # Cấu hình đường dẫn lưu upload và kết quả vào Persistent Volume
     config.server.upload_directory = Path("/root/data/uploads")
+    config.server.websocket_interval_ms = 150
     config.server.cors_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -173,6 +178,8 @@ def fastapi_app():
     ]
     if Path("/root/yolo26n.pt").exists():
         config.detector.model = "/root/yolo26n.pt"
+    if Path("/root/configs/zones.json").exists():
+        config.server.zones_path = "/root/configs/zones.json"
     return create_app(config=config)
 
 
