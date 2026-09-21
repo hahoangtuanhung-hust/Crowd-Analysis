@@ -31,6 +31,7 @@ class TrackedObject:
     y2: float
     confidence: float
     class_id: int = 0
+    observed: bool = True
 
     @property
     def xyxy(self) -> tuple[float, float, float, float]:

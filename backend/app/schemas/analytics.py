@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,6 +15,67 @@ class PopularPath:
     percentage: float
     regions: tuple[str, ...]
     kind: str
+
+
+Cell = tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class DirectedFlowEdge:
+    from_cell: Cell
+    to_cell: Cell
+    unique_tracks_short: int
+    unique_tracks_long: int
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class DirectedFlowSnapshot:
+    from_timestamp: float
+    to_timestamp: float
+    grid_columns: int
+    grid_rows: int
+    edges: tuple[DirectedFlowEdge, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CommonPath:
+    path_id: str
+    origin_zone: str
+    destination_zone: str
+    state: Literal["candidate", "active", "cooling", "retired"]
+    unique_tracks_short: int
+    unique_tracks_long: int
+    score: float
+    confidence: float
+    direction: str
+    polyline: tuple[tuple[float, float], ...]
+    updated_at: float
+    revision: int = 0
+    coordinate_space: str = "image_pixels"
+    support_tracks: int = 0
+    validated_complete_tracks: int = 0
+    evidence_until_s: float = 0.0
+    stale: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CommonPathSnapshot:
+    timestamp: float
+    paths: tuple[CommonPath, ...]
+    version: int = 0
+    evidence_until_s: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class CommonPathTimelinePoint:
+    timestamp: float
+    path_id: str
+    state: str
+    score: float
+    confidence: float
+    unique_tracks_short: int
+    unique_tracks_long: int
 
 
 @dataclass(frozen=True, slots=True)

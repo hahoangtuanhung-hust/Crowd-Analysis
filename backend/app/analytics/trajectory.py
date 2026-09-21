@@ -13,6 +13,7 @@ class _TrackState:
     points: deque[TrackPoint]
     age: int
     last_seen_timestamp: float
+    accepted_count: int
 
 
 class TrajectoryManager:
@@ -40,6 +41,8 @@ class TrajectoryManager:
         observed_ids: list[int] = []
 
         for track in tracks:
+            if not track.observed:
+                continue
             state = self._tracks.get(track.track_id)
             if state is None:
                 self._reserve_track_slot()
@@ -47,20 +50,32 @@ class TrajectoryManager:
                     points=deque(maxlen=self._config.trajectory_history_points),
                     age=0,
                     last_seen_timestamp=timestamp,
+                    accepted_count=0,
                 )
                 self._tracks[track.track_id] = state
 
             raw_x, raw_y = track.bottom_center
             if state.points:
                 previous = state.points[-1]
+                raw_dist = ((raw_x - previous.x) ** 2 + (raw_y - previous.y) ** 2) ** 0.5
+                if raw_dist > self._config.max_movement_step_pixels:
+                    raw_x, raw_y = previous.x, previous.y
+                    raw_dist = 0.0
+
                 alpha = self._config.trajectory_smoothing_alpha
-                x = alpha * raw_x + (1.0 - alpha) * previous.x
-                y = alpha * raw_y + (1.0 - alpha) * previous.y
+                effective_alpha = alpha * 0.5 if raw_dist < 3.5 else alpha
+                x = effective_alpha * raw_x + (1.0 - effective_alpha) * previous.x
+                y = effective_alpha * raw_y + (1.0 - effective_alpha) * previous.y
             else:
                 x, y = raw_x, raw_y
 
             state.age += 1
             state.last_seen_timestamp = timestamp
+            if state.points:
+                distance = ((x - state.points[-1].x) ** 2 + (y - state.points[-1].y) ** 2) ** 0.5
+                if distance < self._config.trajectory_min_point_distance_pixels:
+                    observed_ids.append(track.track_id)
+                    continue
             state.points.append(
                 TrackPoint(
                     track_id=track.track_id,
@@ -73,6 +88,10 @@ class TrajectoryManager:
                     confidence=track.confidence,
                 )
             )
+            state.accepted_count += 1
+            cutoff = timestamp - self._config.trajectory_max_history_seconds
+            while len(state.points) > 1 and state.points[0].timestamp < cutoff:
+                state.points.popleft()
             observed_ids.append(track.track_id)
 
         return tuple(self._snapshot(track_id) for track_id in sorted(set(observed_ids)))
@@ -113,6 +132,6 @@ class TrajectoryManager:
             track_id=track_id,
             points=tuple(state.points),
             age=state.age,
-            confirmed=state.age >= self._config.min_confirmed_points,
+            confirmed=state.accepted_count >= self._config.min_confirmed_points,
             last_seen_timestamp=state.last_seen_timestamp,
         )

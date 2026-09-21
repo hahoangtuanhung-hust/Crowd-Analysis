@@ -1,5 +1,10 @@
 from .analytics import (
+    CommonPath,
+    CommonPathSnapshot,
+    CommonPathTimelinePoint,
     CrowdSummary,
+    DirectedFlowEdge,
+    DirectedFlowSnapshot,
     FlowSnapshot,
     PopularPath,
     TimelinePoint,
@@ -18,8 +23,13 @@ from .tracking import (
 )
 
 __all__ = [
+    "CommonPath",
+    "CommonPathSnapshot",
+    "CommonPathTimelinePoint",
     "CrowdSummary",
     "Detection",
+    "DirectedFlowEdge",
+    "DirectedFlowSnapshot",
     "FlowSnapshot",
     "FramePacket",
     "FrameResult",

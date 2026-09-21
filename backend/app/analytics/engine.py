@@ -5,7 +5,9 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from backend.app.analytics.common_path import CommonPathAnalyzer
 from backend.app.analytics.ddcrp import DDCRPClustering
+from backend.app.analytics.directional_grid import DirectionalGridEngine, GridTrackPoint
 from backend.app.analytics.flow import FlowAnalyzer
 from backend.app.analytics.heatmap import HeatmapAnalyzer, HeatmapWindow
 from backend.app.analytics.spatial import SpatialTransformer
@@ -13,7 +15,9 @@ from backend.app.analytics.trajectory import TrajectoryManager
 from backend.app.analytics.zones import ZoneAnalyzer
 from backend.app.core.config import AnalyticsConfig
 from backend.app.schemas import (
+    CommonPathSnapshot,
     CrowdSummary,
+    DirectedFlowSnapshot,
     FlowSnapshot,
     FrameResult,
     HeatmapSnapshot,
@@ -40,21 +44,23 @@ class AnalyticsEngine:
         transformer: SpatialTransformer,
         *,
         retain_entire: bool,
+        camera_id: str = "cam01",
+        stream_epoch: str = "initial",
     ) -> None:
         self.config = config
+        self.camera_id = camera_id
         self.transformer = transformer
         self.retain_entire = retain_entire
         self.trajectories = TrajectoryManager(config)
         self.heatmaps = HeatmapAnalyzer(config, transformer, retain_entire=retain_entire)
         self.flows = FlowAnalyzer(config, transformer, retain_entire=retain_entire)
         self.zones = ZoneAnalyzer(config, transformer, retain_entire=retain_entire)
-        self.ddcrp = DDCRPClustering(
-            config,
-            alpha=config.ddcrp_alpha,
-            spatial_scale=config.ddcrp_spatial_scale,
-            direction_weight=config.ddcrp_direction_weight,
-            stationary_threshold=config.ddcrp_stationary_threshold,
+        self.common_path = CommonPathAnalyzer(config, transformer)
+        self.directional_path = DirectionalGridEngine(
+            config.directional_grid, transformer, camera_id=camera_id,
+            stream_epoch=stream_epoch, zones=config.zones
         )
+        self.ddcrp = DDCRPClustering(config)
         self._lock = threading.RLock()
         self._current_count = 0
         self._peak_count = 0
@@ -78,8 +84,32 @@ class AnalyticsEngine:
             self.heatmaps.process(trajectories)
             self.flows.process(trajectories)
             self.zones.process(trajectories)
+            latest_points = tuple(
+                trajectory.points[-1]
+                for trajectory in trajectories
+                if trajectory.points
+                and trajectory.points[-1].frame_id == result.packet.frame_id
+            )
+            engine_mode = self.config.common_path.engine
+            if engine_mode in ("legacy", "shadow"):
+                self.common_path.process_points(
+                    latest_points,
+                    active_track_ids=(track.track_id for track in result.tracks),
+                    timestamp=timestamp,
+                )
+            if engine_mode in ("directional_grid", "shadow"):
+                confirmed_ids = {trajectory.track_id for trajectory in trajectories
+                                 if trajectory.confirmed}
+                self.directional_path.update(
+                    (GridTrackPoint(self.camera_id, self.directional_path.stream_epoch,
+                                    track.track_id, 0, result.packet.frame_id,
+                                    timestamp, *track.bottom_center)
+                     for track in result.tracks
+                     if track.observed and track.track_id in confirmed_ids),
+                    timestamp,
+                )
             if self.config.ddcrp_enabled:
-                self.ddcrp.observe_all(trajectories)
+                self.ddcrp.observe_all(trajectories, timestamp=timestamp)
             self._latest_trajectories = trajectories
 
             self._current_count = len(result.tracks)
@@ -104,6 +134,8 @@ class AnalyticsEngine:
     def finalize(self) -> None:
         with self._lock:
             self.flows.finalize_all()
+            if self.config.common_path.engine in ("legacy", "shadow"):
+                self.common_path.finalize_all()
 
     def summary(self) -> CrowdSummary:
         with self._lock:
@@ -143,6 +175,35 @@ class AnalyticsEngine:
                 combined = ddcrp_paths + [p for p in zone_paths if not any(p.label == d.label for d in ddcrp_paths)]
                 return tuple(sorted(combined, key=lambda p: -p.count)[:limit])
             return self.zones.top_paths(limit) or self.flows.top_paths(limit)
+
+    def common_path_snapshot(self) -> CommonPathSnapshot:
+        with self._lock:
+            if self.config.common_path.engine == "directional_grid" or (
+                self.config.common_path.engine == "shadow" and
+                self.config.common_path.shadow_display == "directional_grid"
+            ):
+                return self.directional_path.snapshot()
+            if self.config.ddcrp_enabled:
+                return self.ddcrp.snapshot()
+            return self.common_path.snapshot()
+
+    def common_path_flows(self) -> DirectedFlowSnapshot:
+        with self._lock:
+            if self.config.common_path.engine in ("directional_grid", "shadow"):
+                return self.directional_path.flow_snapshot()
+            return self.common_path.flow_snapshot()
+
+    def common_path_metrics(self) -> dict[str, int | float | None]:
+        with self._lock:
+            if self.config.common_path.engine == "directional_grid":
+                return {"directional_tracks": len(self.directional_path._tracks),
+                        "directional_retained_points": self.directional_path.retained_points,
+                        "directional_cap_drops": self.directional_path.overflow}
+            metrics = self.common_path.metrics()
+            if self.config.common_path.engine == "shadow":
+                metrics.update({"directional_tracks": len(self.directional_path._tracks),
+                                "directional_cap_drops": self.directional_path.overflow})
+            return metrics
 
 
     def timeline(self) -> tuple[TimelinePoint, ...]:

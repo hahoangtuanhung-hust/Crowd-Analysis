@@ -20,6 +20,7 @@ class TrajectoryPoint:
     timestamp: float
     x: float
     y: float
+    confidence: float
     zone_id: str | None
 
     def as_csv_row(self) -> dict[str, str | int | float]:
@@ -30,6 +31,7 @@ class TrajectoryPoint:
             "timestamp": round(self.timestamp, 6),
             "x": round(self.x, 3),
             "y": round(self.y, 3),
+            "confidence": round(self.confidence, 4),
             "zone_id": self.zone_id or "",
         }
 
@@ -123,6 +125,8 @@ class PointTrackletManager:
         persist: list[TrajectoryPoint] = []
 
         for track in tracks:
+            if not track.observed:
+                continue
             state = self._states.get(track.track_id)
             if state is None:
                 overflow = self._reserve_track_slot()
@@ -139,9 +143,20 @@ class PointTrackletManager:
             if state.current_x is None or state.current_y is None:
                 x, y = raw_x, raw_y
             else:
+                raw_dist = math.hypot(raw_x - state.current_x, raw_y - state.current_y)
+                # If displacement in a single frame exceeds max_movement_step_pixels,
+                # it is an erroneous jump (e.g. swapped to adjacent person during occlusion/crossing).
+                # Clamp raw coordinates to prevent dragging the smoothed state to the wrong person.
+                if raw_dist > self.analytics.max_movement_step_pixels:
+                    raw_x, raw_y = state.current_x, state.current_y
+                    raw_dist = 0.0
+
                 alpha = self.analytics.trajectory_smoothing_alpha
-                x = alpha * raw_x + (1.0 - alpha) * state.current_x
-                y = alpha * raw_y + (1.0 - alpha) * state.current_y
+                # Adaptive smoothing: damp micro-jitter when nearly stationary
+                effective_alpha = alpha * 0.5 if raw_dist < 3.5 else alpha
+                x = effective_alpha * raw_x + (1.0 - effective_alpha) * state.current_x
+                y = effective_alpha * raw_y + (1.0 - effective_alpha) * state.current_y
+
             state.current_x, state.current_y = x, y
             self._observe_zone(state, x, y)
 
@@ -161,6 +176,7 @@ class PointTrackletManager:
                 timestamp=timestamp,
                 x=x,
                 y=y,
+                confidence=track.confidence,
                 zone_id=state.stable_zone,
             )
             history.append(point)
