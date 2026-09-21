@@ -50,6 +50,24 @@ def test_api_upload_process_and_analytics(tmp_path: Path) -> None:
         assert health.status_code == 200
         assert health.json()["session"] is None
 
+        runtime = client.get("/api/runtime")
+        assert runtime.status_code == 200
+        assert runtime.json()["mode"] == "live"
+
+        visualization = client.get("/api/config/visualization")
+        assert visualization.status_code == 200
+        assert visualization.json()["show_tracking_points"] is True
+        assert visualization.json()["show_individual_trajectories"] is False
+        assert visualization.json()["show_zones"] is False
+
+        updated_visualization = client.patch(
+            "/api/config/visualization",
+            json={"show_zones": True, "show_direction_arrows": False},
+        )
+        assert updated_visualization.status_code == 200
+        assert updated_visualization.json()["show_zones"] is True
+        assert updated_visualization.json()["show_direction_arrows"] is False
+
         with video_path.open("rb") as stream:
             uploaded = client.post(
                 "/api/video/upload",
@@ -67,6 +85,10 @@ def test_api_upload_process_and_analytics(tmp_path: Path) -> None:
             status = client.get("/health").json()["session"]["status"]
             time.sleep(0.02)
         assert status == "completed"
+        session = client.get("/health").json()["session"]
+        assert session["frame_id"] == 7
+        assert session["media_timestamp_s"] >= 0.0
+        assert len(session["stream_epoch"]) == 32
 
         summary = client.get("/api/analytics/summary").json()["summary"]
         assert summary["processed_frames"] == 8
@@ -84,6 +106,13 @@ def test_api_upload_process_and_analytics(tmp_path: Path) -> None:
         assert metrics["tracking_ms"] is not None
         assert metrics["analytics_ms"] is not None
         assert metrics["gpu_utilization"] is None
+        assert client.get("/api/analytics/metrics").status_code == 200
+
+        common_paths = client.get("/api/analytics/common-paths").json()
+        assert set(common_paths) == {"timestamp", "paths"}
+        directed_flows = client.get("/api/analytics/flows").json()
+        assert directed_flows["grid_columns"] == config.analytics.common_path.grid_columns
+        assert isinstance(directed_flows["edges"], list)
 
         frame = client.get("/api/stream/frame.jpg")
         assert frame.status_code == 200
@@ -94,6 +123,11 @@ def test_api_upload_process_and_analytics(tmp_path: Path) -> None:
             snapshot = websocket.receive_json()
             assert snapshot["type"] == "snapshot"
             assert snapshot["session"]["status"] == "completed"
+            assert isinstance(snapshot["common_paths"], list)
+            assert isinstance(snapshot["points"], list)
+            assert snapshot["visualization"]["show_zones"] is True
+            assert "trajectories" not in snapshot
+            assert "trajectory_history" not in snapshot
 
         calibrated = client.post(
             "/api/calibration",

@@ -65,20 +65,36 @@ Benchmark the test clip across `imgsz=640/960/1280` and
 python -m scripts.benchmark_tracking data/videos/data-test.mp4 --max-frames 150
 ```
 
-Process the full clip with the measured default configuration:
+Process the clip with the measured default point-only production configuration:
 
 ```powershell
-python -m scripts.process_point_tracks data/videos/data-test.mp4 --zones configs/zones.json
+python -m scripts.process_point_tracks data/videos/data-test.mp4 `
+  --zones configs/zones.json `
+  --output-dir outputs/point-only-common-path `
+  --max-frames 600
+```
+
+Replay the produced real trajectories across the documented Common Path parameter matrix:
+
+```powershell
+python -m scripts.benchmark_common_path
 ```
 
 For a quick functional run, add `--max-frames 300 --output-dir outputs/smoke`. The command
-writes exactly these six artifacts:
+writes these bounded tracking and Common Path artifacts:
 
+- `common_path_map.png`: latest active/candidate/cooling paths over the camera view;
+- `common_path_timeline.csv`: periodic path state, score, confidence and unique-ID support;
+- `common_paths.json`: latest immutable Top Common Paths snapshot;
+- `edge_flows.json`: directed grid edges with short/long unique-track support;
 - `frame_metrics.csv`: per-frame detections, active/new/lost tracks, FPS and inference latency;
 - `heatmap.png`: density accumulated from confirmed track points;
 - `path_map.png`: completed routes and the top entry/exit flows ranked by unique Track ID;
-- `tracked_points.mp4`: bottom-center points, Track IDs, bounded tails, direction, count, FPS and latency;
-- `trajectories.csv`: confirmed point tracks with `camera_id,track_id,frame_id,timestamp,x,y,zone_id`;
+- `realtime_point_common_path.mp4`: production view with current bottom-center points and confirmed
+  Common Paths, without boxes, IDs, individual trajectories, zones, grids or candidates;
+- `tracked_points.mp4`: compatibility copy of the point-only production video;
+- `trajectories.csv`: confirmed point tracks with confidence and debounced zone membership;
+- `realtime_benchmark.csv`: measured stage, queue, path-compute and resource metrics;
 - `zone_flows.json`: measured run summary and deduplicated first-zone to last-zone flows;
 
 The Modal entry point uses the same contract and defaults to `data/videos/data-test.mp4`:
@@ -86,6 +102,31 @@ The Modal entry point uses the same contract and defaults to `data/videos/data-t
 ```powershell
 modal run modal_app.py --output-dir output_modal
 ```
+
+### Directional Grid Common Path
+
+`analytics.common_path.engine` selects the implementation without changing detection or
+tracking: `directional_grid` is the new validated engine, `shadow` runs both engines from the
+same observations and displays `shadow_display`, and `legacy` is the rollback setting.
+
+Run the bounded 25-second GPU smoke on Modal (one T4, 600-second timeout):
+
+```powershell
+$env:PYTHONUTF8="1"
+modal run --quiet modal_common_path.py `
+  --input data/videos/data-test.mp4 `
+  --start-seconds 0 --duration-seconds 25 `
+  --engine shadow --mode offline_fast `
+  --config configs/default.yaml `
+  --run-id dg-smoke-YYYYMMDD-a --cache-policy reuse
+```
+
+The remote job saves a content-addressed detection/track cache and run artifacts in the
+`crowd-analysis-data` Volume, then downloads only that run to `outputs/common_path/<run-id>/`.
+Changing only grid/path analytics must use `scripts.common_path_clip --replay-cache ...`; that
+path refuses a cache whose input/model/detector/tracker key does not match and does no inference.
+Use `python -m scripts.replay_ui --cache <tracking_cache.jsonl>` to smoke the MJPEG pipeline from
+the Modal cache without loading YOLO locally.
 
 The Shibuya wide-angle view needs the tiled small-person profile. Run it on a GPU because each
 frame includes one full-frame pass plus four overlapping tiles:
@@ -103,6 +144,66 @@ modal run --quiet --timestamps modal_app.py `
 Use `--max-frames 300` for a short GPU smoke test. The empty Shibuya zone file intentionally
 disables Grand Central polygons; add camera-specific polygons before interpreting zone flows.
 
+### Live Shibuya from Modal
+
+The live path runs YOLO, ByteTrack, dominant live-flow analytics and rendering in one ordered
+Modal T4 session. The browser receives binary JPEG packets directly over an authenticated
+WebSocket; the token below is an ephemeral session token, not a Modal account token.
+
+Terminal 1 (repository root):
+
+```powershell
+$env:LIVE_SESSION_TOKEN = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(24)).ToLower()
+Write-Host $env:LIVE_SESSION_TOKEN
+modal serve modal_shibuya_live.py
+```
+
+Copy both the generated session token and the `https://...modal.run` URL printed by Modal.
+Change the URL scheme to `wss`, append `/ws/live`, then start the UI in Terminal 2:
+
+Replace the angle-bracket examples below with real values. Do not run them literally: unresolved
+`<modal-host>` or `<the-session-token-from-terminal-1>` values are rejected and shown as a UI
+configuration error.
+
+```powershell
+Set-Location frontend
+$env:VITE_MODAL_LIVE_WS_URL = "wss://<modal-host>/ws/live"
+$env:VITE_MODAL_LIVE_TOKEN = "<the-session-token-from-terminal-1>"
+$env:VITE_MODAL_LIVE_DURATION_SECONDS = "200"
+$env:VITE_MODAL_LIVE_PREVIEW_FPS = "10"
+$env:VITE_MODAL_LIVE_RUN_ID = "live-dominant-YYYYMMDD-smoke"
+npm run dev -- --port 5176
+```
+
+Open `http://localhost:5176`, press **Start GPU inference**, and use **Stop** to finalize the
+200-second Shibuya run early. For routine smoke tests, temporarily set `duration` to 20-30 seconds.
+Each live run performs new CUDA
+inference, so replay analytics changes from the downloaded `tracking_cache.jsonl` instead of
+starting another GPU session. Stop both terminals after testing; `modal serve` then tears down
+the ephemeral deployment.
+
+The live endpoint accepts only `realtime_pts`: playback is paced by source timestamps and stale
+input frames are dropped when CUDA inference cannot keep up. The output is stored remotely under
+`/root/data/common_path/runs/<run-id>` and should be downloaded to
+`outputs/common_path/<run-id>`. Set `analytics.dominant_live_flow.mode` back to
+`validated_route` to roll the analytics engine back without changing the streaming transport.
+
+To render the time-varying dominant movement direction from the immutable Shibuya cache on a
+Modal T4, without rerunning YOLO:
+
+```powershell
+$env:PYTHONUTF8="1"
+modal run --quiet --timestamps modal_dominant_path.py `
+  --cache-run-id shibuya-live-integration-20260920 `
+  --config configs/shibuya.yaml `
+  --run-id shibuya-dominant-YYYYMMDD
+```
+
+`analytics.directional_grid.display_policy: dominant_direction` ranks recent direction bins by
+deduplicated Track ID support in `short_window_seconds`, selects the strongest connected cell
+component, and draws its centerline causally on each output frame. Set it back to
+`validated_route` to restore the complete-route validator.
+
 `configs/zones.json` uses pixel-space polygons for the fixed 1920x1080 camera. Each zone accepts
 the documented `id`, `name`, and `points` fields. Coordinates are scaled when the input resolution
 differs. Edit these polygons before using another camera view.
@@ -111,7 +212,9 @@ differs. Edit these polygons before using another camera view.
 
 1. Select **Video** and upload MP4/MOV/AVI/MKV, or select **RTSP** and enter the stream URL.
 2. Start the session. File input processes to completion; RTSP remains live and reconnects with exponential backoff.
-3. Toggle detection, tracking, trajectory, video heatmap and zone overlays independently.
+3. The production view starts with tracking points, confirmed Common Paths, direction arrows and
+   metrics. IDs, individual paths, zones, heatmap, grid, edge flow and candidates are opt-in debug
+   overlays.
 4. Use **Calibrate** to place four ordered ground-plane corners and enter real-world width/height.
 5. Use **Zones** to draw and name one or more polygons.
 6. Inspect occupancy vs movement heatmaps, current/1m/5m/entire windows, vector field, routes, timeline, zone transitions and stage latency.
@@ -129,6 +232,23 @@ All thresholds and resource bounds live in [`configs/default.yaml`](configs/defa
 - trajectory smoothing/history/TTL/cardinality;
 - heatmap grid, time retention, movement threshold and Gaussian sigma;
 - route grid/cardinality, zone debounce, upload/JPEG/WebSocket settings.
+
+Realtime Common Path uses an 8x5 camera-specific macro grid for the supplied Grand Central
+time-lapse. Each directed edge counts a Track ID at most once. One-second buckets feed a
+30-second short window and 180-second long window with exponential age decay. Candidate paths
+are extracted with positive-cost Dijkstra every 3 seconds and must retain at least 5 unique
+tracks for 8 seconds before promotion. A 20% margin is required to replace an active path;
+similar directed-edge paths are merged and inactive paths cool for 20 seconds before retirement.
+The grid remains configurable; finer 16x9 and 32x18 grids did not produce sufficient connected
+edge support on the supplied trajectory data at the required support thresholds.
+Measured implementation details, before/after results and limitations are in
+[`docs/common_path_realtime_report.md`](docs/common_path_realtime_report.md).
+
+Visualization defaults are shared by backend and frontend under `visualization` in the YAML
+configuration. The renderer draws a bounded-width translucent corridor, centerline and regularly
+spaced direction arrows. When a confirmed route changes, both polylines are resampled and
+interpolated over 500 ms. Individual tracklets remain bounded internal analytics state and are
+never passed to the production renderer unless the explicit individual-path debug toggle is on.
 
 The `data-test.mp4` default is YOLO26n + ByteTrack, class `person`, `imgsz=1280`, detector
 confidence `0.05`, new-track confidence `0.15`, and inference interval 1. Low-confidence boxes
@@ -151,14 +271,19 @@ compatible terms.
 | POST | `/api/video/upload` | Chunked, size/type-limited video upload |
 | POST | `/api/stream/start` | Start uploaded token or RTSP URL |
 | POST | `/api/stream/stop` | Stop active session |
-| PUT | `/api/overlay` | Update five overlay switches |
+| PUT | `/api/overlay` | Compatibility endpoint for the active session overlay |
+| GET | `/api/config/visualization` | Current shared production/debug visualization settings |
+| PATCH | `/api/config/visualization` | Update visualization settings for current and future sessions |
 | POST | `/api/calibration` | Set four-point ground-plane homography |
 | PUT | `/api/zones` | Replace polygon zone configuration |
 | GET | `/api/analytics/summary` | Count summary and timeline |
 | GET | `/api/analytics/heatmap` | Occupancy/movement grid by time window |
 | GET | `/api/analytics/flow` | Grid vector field and dominant direction |
 | GET | `/api/analytics/paths` | Ranked grid/zone routes |
+| GET | `/api/analytics/common-paths` | Stable candidate/active/cooling Common Paths |
+| GET | `/api/analytics/flows` | Directed grid edges with unique-track support |
 | GET | `/api/analytics/zones` | Zone occupancy, entries, exits, dwell, flow |
+| GET | `/api/analytics/metrics` | Pipeline, queue and Common Path metrics |
 | GET | `/api/stream/frame.jpg` | Latest processed JPEG |
 | GET | `/api/stream.mjpg` | MJPEG stream |
 | WS | `/ws/live` | Live dashboard snapshot |

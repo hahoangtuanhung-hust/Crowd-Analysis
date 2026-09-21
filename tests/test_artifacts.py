@@ -13,13 +13,19 @@ def write_artifacts(directory: Path) -> None:
         (directory / name).write_bytes(b"artifact")
 
 
-def test_point_tracking_artifact_contract_has_exact_six_names() -> None:
+def test_point_tracking_artifact_contract_includes_common_path_outputs() -> None:
     assert POINT_TRACKING_ARTIFACTS == (
+        "common_path_map.png",
+        "common_path_timeline.csv",
+        "common_paths.json",
+        "edge_flows.json",
         "frame_metrics.csv",
         "heatmap.png",
         "path_map.png",
+        "realtime_point_common_path.mp4",
         "tracked_points.mp4",
         "trajectories.csv",
+        "realtime_benchmark.csv",
         "zone_flows.json",
     )
 

@@ -11,10 +11,14 @@ flowchart LR
     C -->|bounded latest-frame queue| D[YOLO26n detector]
     D --> T[ByteTrack]
     T -->|bounded result queue| E[Analytics engine]
-    E --> R[Overlay + JPEG]
+    E --> Q[Immutable current-point snapshot]
+    E --> R[Point-only overlay + JPEG]
     E --> H[Heatmap buckets]
-    E --> F[Flow + route grid]
+    E --> F[Unique-track directed grid flow]
+    F --> P[3-second Common Path snapshot computation]
     E --> Z[Zones + transitions]
+    Q --> R
+    P --> R
     R --> A
     H --> A
     F --> A
@@ -49,8 +53,11 @@ Tracker and analytics state belong to one camera session. The detector is expose
 - Tracker output: session-local track ID plus box/confidence.
 - Trajectory point: frame ID, source timestamp, raw bottom-center and EMA-smoothed bottom-center.
 - Spatial aggregates: fixed-size occupancy/movement/flow grids and fixed-duration buckets.
-- Product aggregates: crowd timeline, compressed grid routes, zone occupancy, entries, exits, dwell and zone transitions.
-- Delivery: latest JPEG cache, JSON REST snapshots and low-frequency WebSocket updates. Raw frames are not persisted by the server.
+- Product aggregates: crowd timeline, short/long decayed directed flows, stable Common Paths,
+  zone occupancy, entries, exits, dwell and zone transitions.
+- Delivery: latest point-only JPEG cache, compact current-point/Common Path JSON snapshots and
+  low-frequency WebSocket updates. Individual trajectory history is not sent to the browser and
+  raw frames are not persisted by the server.
 
 ## Scale path
 

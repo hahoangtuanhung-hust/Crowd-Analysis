@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from backend.app.core.config import AppConfig, DetectorConfig, TrackerConfig, load_config
+from backend.app.core.config import (
+    AppConfig,
+    CommonPathStyleConfig,
+    DetectorConfig,
+    TrackerConfig,
+    load_config,
+)
 
 
 def test_default_config_loads() -> None:
@@ -50,3 +56,8 @@ def test_detector_threshold_must_feed_bytetrack_low_confidence_stage() -> None:
 def test_config_rejects_unknown_keys() -> None:
     with pytest.raises(ValidationError):
         AppConfig.model_validate({"unknown": True})
+
+
+def test_common_path_style_rejects_inverted_widths() -> None:
+    with pytest.raises(ValidationError, match="min_width_pixels"):
+        CommonPathStyleConfig(min_width_pixels=20, max_width_pixels=10)

@@ -6,7 +6,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from backend.app.core.config import TrackerConfig
+from backend.app.core.config import (
+    AnalyticsConfig,
+    AppConfig,
+    CommonPathConfig,
+    TrackerConfig,
+    VideoConfig,
+)
+from backend.app.core.session import ProcessingSession
 from backend.app.schemas import Detection, FramePacket, FrameResult
 from backend.app.tracking import ByteTrackTracker
 from backend.app.video import OpenCVVideoSource, TrackingPipeline
@@ -63,6 +70,37 @@ def test_pipeline_processes_file_without_dropping(tmp_path: Path) -> None:
     stable_ids = [track.track_id for result in results for track in result.tracks]
     assert len(stable_ids) >= 6
     assert len(set(stable_ids)) == 1
+
+
+def test_pipeline_passes_frame_packet_to_cache_detector(tmp_path: Path) -> None:
+    video_path = tmp_path / "packet.mp4"
+    make_video(video_path, frame_count=3)
+
+    class PacketDetector:
+        def __init__(self) -> None:
+            self.frame_ids: list[int] = []
+
+        def detect(self, _frame: np.ndarray) -> list[Detection]:
+            raise AssertionError("Cache-backed detection must receive FramePacket")
+
+        def detect_packet(self, packet: FramePacket) -> list[Detection]:
+            self.frame_ids.append(packet.frame_id)
+            return [Detection(20, 20, 60, 100, 0.95)]
+
+    detector = PacketDetector()
+    pipeline = TrackingPipeline(
+        OpenCVVideoSource(video_path),
+        detector,
+        ByteTrackTracker(TrackerConfig()),
+        queue_size=2,
+        drop_oldest=False,
+    )
+
+    pipeline.start()
+
+    assert pipeline.join(timeout=10.0)
+    assert pipeline.stats.error is None
+    assert detector.frame_ids == [0, 1, 2]
 
 
 def test_latest_queue_drops_oldest() -> None:
@@ -148,3 +186,68 @@ def test_realtime_pipeline_reconnects_after_source_ends() -> None:
     assert pipeline.join(timeout=5.0)
     assert source.open_count >= 2
     assert len(results) >= 3
+
+
+def test_slow_analytics_worker_does_not_block_inference_worker(tmp_path: Path) -> None:
+    video_path = tmp_path / "slow-analytics.mp4"
+    make_video(video_path, frame_count=20)
+    config = AppConfig(
+        video=VideoConfig(
+            queue_size=2,
+            analytics_queue_size=100,
+            stale_frame_policy="block",
+        )
+    )
+    session = ProcessingSession(
+        camera_id="test-camera",
+        source_uri=str(video_path),
+        source_kind="upload",
+        realtime=False,
+        detector=FixedDetector(),
+        config=config,
+    )
+    original = session.analytics.process_frame
+
+    def slow_process(result: FrameResult):
+        time.sleep(0.03)
+        return original(result)
+
+    session.analytics.process_frame = slow_process  # type: ignore[method-assign]
+    session.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and session.pipeline.stats.processed_frames < 20:
+        time.sleep(0.01)
+
+    assert session.pipeline.stats.processed_frames == 20
+    assert session.snapshot().status == "running"
+    assert session.metrics()["analytics_queue_size"] > 0
+    assert session.wait(timeout=10.0)
+    assert session.snapshot().status == "completed"
+
+
+def test_processing_session_runs_directional_grid_with_camera_id(tmp_path: Path) -> None:
+    video_path = tmp_path / "directional-grid.mp4"
+    make_video(video_path)
+    config = AppConfig(
+        analytics=AnalyticsConfig(
+            common_path=CommonPathConfig(engine="directional_grid"),
+        ),
+    )
+    session = ProcessingSession(
+        camera_id="directional-camera",
+        source_uri=str(video_path),
+        source_kind="upload",
+        realtime=False,
+        detector=FixedDetector(),
+        config=config,
+    )
+
+    session.start()
+
+    assert session.wait(timeout=10.0)
+    assert session.snapshot().status == "completed"
+    assert session.analytics.directional_path.camera_id == "directional-camera"
+    assert all(
+        point.frame_id == session.snapshot().frame_id
+        for point in session.current_points()
+    )
