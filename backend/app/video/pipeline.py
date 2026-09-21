@@ -92,7 +92,8 @@ class TrackingPipeline:
         )
         self._processing_thread = threading.Thread(
             target=self._processing_loop,
-            name="inference-worker",
+            name=("cache-replay-worker" if callable(getattr(self.detector, "detect_packet", None))
+                  else "inference-worker"),
             daemon=True,
         )
         self._processing_thread.start()
@@ -174,7 +175,12 @@ class TrackingPipeline:
                     continue
 
                 inference_started = time.perf_counter()
-                detections = self.detector.detect(item.image)
+                packet_detector = getattr(self.detector, "detect_packet", None)
+                detections = (
+                    packet_detector(item)
+                    if callable(packet_detector)
+                    else self.detector.detect(item.image)
+                )
                 inference_ms = (time.perf_counter() - inference_started) * 1000.0
 
                 tracking_started = time.perf_counter()

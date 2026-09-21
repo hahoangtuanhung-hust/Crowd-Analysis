@@ -34,7 +34,31 @@ class OverlayRequest(RequestModel):
     tracking: bool = True
     trajectory: bool = True
     heatmap: bool = False
-    zones: bool = True
+    zones: bool = False
+    points: bool = True
+    track_ids: bool = False
+    trajectory_tails: bool = False
+    grid: bool = False
+    edge_flows: bool = False
+    candidate_paths: bool = False
+    active_paths: bool = True
+    direction_arrows: bool = True
+    debug_metrics: bool = True
+
+
+class VisualizationPatchRequest(RequestModel):
+    show_bounding_boxes: bool | None = None
+    show_track_ids: bool | None = None
+    show_tracking_points: bool | None = None
+    show_individual_trajectories: bool | None = None
+    show_common_path: bool | None = None
+    show_direction_arrows: bool | None = None
+    show_candidate_path: bool | None = None
+    show_zones: bool | None = None
+    show_heatmap: bool | None = None
+    show_grid_debug: bool | None = None
+    show_edge_flow_debug: bool | None = None
+    show_metrics: bool | None = None
 
 
 class CalibrationRequest(RequestModel):
@@ -102,8 +126,26 @@ def create_app(
             "session": asdict(session.snapshot()) if session else None,
         }
 
+    @app.get("/api/runtime")
+    def runtime_info() -> dict:
+        provider = getattr(session_manager, "runtime_info", None)
+        if callable(provider):
+            return provider()
+        return {
+            "mode": "live",
+            "source_mode": "configured_input",
+            "inference_executed": None,
+            "detector_calls": None,
+            "cache_reads": None,
+        }
+
     @app.get("/metrics")
     def metrics() -> dict:
+        session = session_manager.current
+        return session.metrics() if session else _empty_metrics()
+
+    @app.get("/api/analytics/metrics")
+    def analytics_metrics() -> dict:
         session = session_manager.current
         return session.metrics() if session else _empty_metrics()
 
@@ -206,6 +248,19 @@ def create_app(
         options = OverlayOptions(**request.model_dump())
         session.set_overlay(options)
         return request.model_dump()
+
+    @app.get("/api/config/visualization")
+    def visualization_config() -> dict:
+        return session_manager.visualization().model_dump()
+
+    @app.patch("/api/config/visualization")
+    def patch_visualization(request: VisualizationPatchRequest) -> dict:
+        changes = {
+            key: value
+            for key, value in request.model_dump().items()
+            if value is not None
+        }
+        return session_manager.update_visualization(changes).model_dump()
 
     @app.post("/api/calibration")
     def update_calibration(request: CalibrationRequest) -> dict:
@@ -312,6 +367,32 @@ def create_app(
         paths = session.analytics.top_paths(limit) if session else ()
         return {"paths": [asdict(item) for item in paths]}
 
+    @app.get("/api/analytics/common-paths")
+    def analytics_common_paths() -> dict:
+        session = session_manager.current
+        if session is None:
+            return {"timestamp": 0.0, "paths": []}
+        snapshot = session.analytics.common_path_snapshot()
+        return {
+            "timestamp": snapshot.timestamp,
+            "paths": [asdict(item) for item in snapshot.paths],
+        }
+
+    @app.get("/api/analytics/flows")
+    def analytics_directed_flows() -> dict:
+        session = session_manager.current
+        if session is None:
+            settings = app_config.analytics.common_path
+            return {
+                "from_timestamp": 0.0,
+                "to_timestamp": 0.0,
+                "grid_columns": settings.grid_columns,
+                "grid_rows": settings.grid_rows,
+                "edges": [],
+            }
+        snapshot = session.analytics.common_path_flows()
+        return asdict(snapshot)
+
     @app.get("/api/analytics/zones")
     def analytics_zones() -> dict:
         session = session_manager.current
@@ -356,6 +437,11 @@ def create_app(
         return StreamingResponse(
             frames(),
             media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "X-Accel-Buffering": "no",          # nginx proxy: không buffer
+                "Connection": "keep-alive",
+            },
         )
 
     @app.websocket("/ws/live")
@@ -371,17 +457,36 @@ def create_app(
                         "summary": _empty_summary(),
                         "metrics": _empty_metrics(),
                         "paths": [],
+                        "common_paths": [],
+                        "points": [],
+                        "visualization": session_manager.visualization().model_dump(),
                         "zones": [],
                         "timeline": [],
                     }
                 else:
                     zone_snapshot = session.analytics.zone_snapshot()
+                    common_paths = session.analytics.common_path_snapshot().paths
                     payload = {
                         "type": "snapshot",
                         "session": asdict(session.snapshot()),
                         "summary": asdict(session.analytics.summary()),
                         "metrics": session.metrics(),
                         "paths": [asdict(item) for item in session.analytics.top_paths()],
+                        "common_paths": [
+                            asdict(item)
+                            for item in common_paths
+                            if item.state in {"active", "cooling"}
+                        ],
+                        "points": [
+                            {
+                                "track_id": point.track_id,
+                                "x": point.x,
+                                "y": point.y,
+                                "confidence": point.confidence,
+                            }
+                            for point in session.current_points()
+                        ],
+                        "visualization": session_manager.visualization().model_dump(),
                         "zones": [asdict(item) for item in zone_snapshot.zones],
                         "zone_flows": [asdict(item) for item in zone_snapshot.flows],
                         "timeline": [asdict(item) for item in session.analytics.timeline()],
@@ -450,7 +555,20 @@ def _empty_metrics() -> dict:
         "encoding_ms": None,
         "e2e_latency_ms": None,
         "queue_size": 0,
+        "frame_queue_size": 0,
+        "capture_queue_size": 0,
+        "analytics_queue_size": 0,
         "dropped_frames": 0,
+        "active_tracks": 0,
+        "lost_tracks": 0,
+        "completed_tracks": 0,
+        "valid_tracks": 0,
+        "discarded_tracks": 0,
+        "flow_bucket_count": 0,
+        "common_path_switches": 0,
+        "candidate_rejections": 0,
+        "common_path_compute_ms": None,
+        "common_path_compute_ms_p95": None,
         "cpu_percent": 0.0,
         "ram_mb": 0.0,
         "gpu_utilization": None,

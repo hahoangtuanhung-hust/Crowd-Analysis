@@ -3,11 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 POINT_TRACKING_ARTIFACTS = (
+    "common_path_map.png",
+    "common_path_timeline.csv",
+    "common_paths.json",
+    "edge_flows.json",
     "frame_metrics.csv",
     "heatmap.png",
     "path_map.png",
+    "realtime_point_common_path.mp4",
     "tracked_points.mp4",
     "trajectories.csv",
+    "realtime_benchmark.csv",
     "zone_flows.json",
 )
 

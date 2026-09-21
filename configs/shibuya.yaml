@@ -4,7 +4,8 @@ server:
   upload_directory: data/uploads
   max_upload_mb: 500
   jpeg_quality: 82
-  websocket_interval_ms: 250
+  websocket_interval_ms: 150
+  zones_path: configs/shibuya-zones.json
   cors_origins:
     - http://localhost:5173
 
@@ -35,11 +36,11 @@ tracker:
   track_low_thresh: 0.04
   new_track_thresh: 0.08
   track_buffer: 180
-  match_thresh: 0.80
+  match_thresh: 0.72
   fuse_score: false
   association_mode: hybrid
-  max_center_distance_ratio: 0.04
-  second_match_thresh: 0.70
+  max_center_distance_ratio: 0.025
+  second_match_thresh: 0.60
   lost_track_grace_frames: 8
   stationary_lost_track_grace_frames: 30
   stationary_speed_threshold: 2.0
@@ -48,6 +49,7 @@ tracker:
 video:
   inference_interval: 1
   queue_size: 4
+  analytics_queue_size: 1000
   stale_frame_policy: drop_oldest
   reconnect_initial_seconds: 1.0
   reconnect_max_seconds: 30.0
@@ -56,12 +58,14 @@ analytics:
   grid_width: 64
   grid_height: 36
   trajectory_history_points: 150
-  trajectory_smoothing_alpha: 0.35
+  trajectory_smoothing_alpha: 0.18
+  trajectory_min_point_distance_pixels: 4.0
+  trajectory_max_history_seconds: 30.0
   min_confirmed_points: 3
   max_active_tracks: 4096
   inactive_track_ttl_seconds: 15.0
-  movement_threshold_pixels: 1.5
-  max_movement_step_pixels: 250.0
+  movement_threshold_pixels: 1.8
+  max_movement_step_pixels: 30.0
   max_point_gap_seconds: 2.0
   current_window_seconds: 10
   live_retention_seconds: 300
@@ -71,9 +75,133 @@ analytics:
   max_route_cells: 32
   max_completed_paths: 4096
   zone_debounce_points: 2
+  # Paper 479: Hassanein et al. DD-CRP
   ddcrp_enabled: true
-  ddcrp_alpha: 0.4
-  ddcrp_spatial_scale: 75.0
-  ddcrp_direction_weight: 0.6
-  ddcrp_stationary_threshold: 12.0
+  ddcrp_alpha: 0.1
+  ddcrp_theta_min: 0.1
+  ddcrp_theta_max: 0.5
+  ddcrp_delta_min: 10.0
+  ddcrp_delta_max: 100.0
+  ddcrp_tracklet_seconds: 1.5
+  common_path:
+    enabled: true
+    engine: directional_grid
+    grid_columns: 8
+    grid_rows: 5
+    cell_hysteresis_ratio: 0.12
+    cell_confirmation_points: 2
+    bucket_seconds: 1
+    short_window_seconds: 30
+    long_window_seconds: 180
+    short_weight: 0.40
+    long_weight: 0.60
+    update_interval_seconds: 1.0
+    flow_update_interval_seconds: 1.0
+    min_unique_tracks: 1
+    switch_margin: 0.10
+    confirmation_seconds: 0.5
+    cooling_seconds: 20.0
+    min_path_edge_support: 1
+    path_similarity_threshold: 0.10
+    centerline_ema_alpha: 0.20
+    min_track_duration_seconds: 0.8
+    min_track_distance_pixels: 20.0
+    min_track_points: 4
+    max_stationary_speed_pixels_second: 3.0
+    max_step_pixels: 250.0
+    track_lost_timeout_seconds: 4.0
+    zone_min_inside_frames: 2
+    zone_debounce_seconds: 0.5
+    max_path_cells: 128
+    top_k: 1
+  directional_grid:
+    display_policy: dominant_direction
+    dominant_min_support_tracks: 1
+    columns: 32
+    rows: 18
+    direction_bins: 8
+    direction_sample_seconds: 0.3
+    min_track_age_seconds: 0.5
+    min_displacement_cell_fraction: 0.15
+    max_observation_gap_seconds: 0.5
+    max_step_cells: 2.5
+    short_window_seconds: 30
+    long_window_seconds: 180
+    min_edge_unique_tracks: 3
+    min_support_tracks: 5
+    min_complete_tracks: 3
+    min_ordered_coverage: 0.70
+    cell_tolerance: 1
+    confirmation_seconds: 8
+    cooling_seconds: 20
+    switch_relative_margin: 0.20
+    switch_absolute_margin: 0.01
+    update_interval_seconds: 3
+    max_candidates: 5
+    beam_width: 20
+    max_path_cells: 128
+    min_path_cells: 4
+    max_tracks: 2048
+    max_points_per_track: 256
+    max_evidence_keys: 250000
+    route_scope: global_od
+    # Scene-specific diagonal zebra crossing, selected from the first Shibuya frame.
+    # Kept as an audited alternative until cache replay proves ordered S/T support.
+    local_corridor:
+      corridor_id: shibuya-northwest-southeast-crossing
+      coordinate_space: image_normalized
+      roi: [[0.08, 0.25], [0.23, 0.22], [0.96, 0.67], [0.96, 0.80], [0.83, 0.90], [0.70, 0.82], [0.19, 0.46], [0.08, 0.42]]
+      source_gate: [[0.08, 0.26], [0.22, 0.23], [0.29, 0.33], [0.19, 0.45], [0.09, 0.42]]
+      target_gate: [[0.71, 0.68], [0.94, 0.66], [0.96, 0.80], [0.83, 0.90], [0.71, 0.82]]
+      allow_reverse: true
+    diagnostics_enabled: true
+    max_diagnostic_evaluations: 5000
+    max_diagnostic_evidence_samples: 20
+  dominant_live_flow:
+    mode: dominant_live_flow
+    columns: 32
+    rows: 18
+    direction_bins: 8
+    direction_min_seconds: 0.3
+    direction_max_seconds: 0.8
+    direction_smoothing_alpha: 0.4
+    min_displacement_cell_fraction: 0.15
+    observation_timeout_seconds: 0.6
+    history_seconds: 3.0
+    evaluation_interval_seconds: 0.5
+    min_active_tracks: 3
+    confirmation_seconds: 2.0
+    challenger_margin_tracks: 1
+    stale_seconds: 1.5
+    max_tracks: 4096
+    max_points_per_track: 64
+    min_geometry_cells: 1.5
   zones: []
+
+visualization:
+  show_bounding_boxes: false
+  show_track_ids: false
+  show_tracking_points: true
+  show_individual_trajectories: false
+  show_common_path: true
+  show_direction_arrows: true
+  show_candidate_path: false
+  show_zones: false
+  show_heatmap: false
+  show_grid_debug: false
+  show_edge_flow_debug: false
+  show_metrics: true
+  common_path_style:
+    # Yellow/orange keeps the dominant Common Path distinct from cyan tracking points.
+    centerline_color_bgr: [0, 215, 255]
+    corridor_color_bgr: [0, 150, 255]
+    corridor_opacity: 0.25
+    centerline_opacity: 0.75
+    min_width_pixels: 8
+    max_width_pixels: 20
+    arrow_spacing_pixels: 100
+    transition_milliseconds: 500
+  point_style:
+    radius_pixels: 2
+    color_bgr: [0, 255, 255]
+    outline_color_bgr: [0, 0, 0]

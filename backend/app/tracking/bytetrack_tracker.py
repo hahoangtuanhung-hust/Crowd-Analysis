@@ -129,7 +129,14 @@ class ByteTrackTracker:
                 self._frame_diagonal * self._config.max_center_distance_ratio,
             )
             center_cost = np.clip(distances / maximum, 0.0, 1.0).astype(np.float32)
-            cost = np.minimum(cost, center_cost)
+            # When bounding boxes have zero overlap (cost >= 1.0), penalize center distance
+            # so we do not greedily hijack an adjacent person's detection in crowded scenes.
+            gated_center = np.where(
+                cost < 1.0,
+                np.minimum(cost, center_cost),
+                np.clip(center_cost + 0.15, 0.0, 1.0),
+            )
+            cost = gated_center.astype(np.float32)
 
         if fuse_score:
             cost = np.asarray(matching.fuse_score(cost, detections), dtype=np.float32)
@@ -166,7 +173,7 @@ class ByteTrackTracker:
                         strack.mean[4] *= 0.1
                         strack.mean[5] *= 0.1
 
-        output = [self._to_tracked_object(row, width, height) for row in tracked]
+        output = [self._to_tracked_object(row, width, height, observed=True) for row in tracked]
         visible_ids = {item.track_id for item in output}
 
         if self._config.lost_track_grace_frames:
@@ -188,12 +195,16 @@ class ByteTrackTracker:
                     and item.track_id not in visible_ids
                     and 0 < missed_frames <= grace_frames
                 ):
-                    output.append(self._to_tracked_object(item.result, width, height))
+                    output.append(self._to_tracked_object(
+                        item.result, width, height, observed=False
+                    ))
 
         return sorted(output, key=lambda item: item.track_id)
 
     @staticmethod
-    def _to_tracked_object(row: Sequence[float], width: int, height: int) -> TrackedObject:
+    def _to_tracked_object(
+        row: Sequence[float], width: int, height: int, *, observed: bool = True
+    ) -> TrackedObject:
         return TrackedObject(
             x1=float(np.clip(row[0], 0, width - 1)),
             y1=float(np.clip(row[1], 0, height - 1)),
@@ -202,4 +213,5 @@ class ByteTrackTracker:
             track_id=int(row[4]),
             confidence=float(row[5]),
             class_id=int(row[6]),
+            observed=observed,
         )

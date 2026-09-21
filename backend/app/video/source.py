@@ -19,11 +19,14 @@ class VideoMetadata:
 
 
 class OpenCVVideoSource:
-    def __init__(self, source: str | Path, *, max_frames: int | None = None) -> None:
+    def __init__(
+        self, source: str | Path, *, max_frames: int | None = None, pace: bool = False
+    ) -> None:
         if max_frames is not None and max_frames < 1:
             raise ValueError("max_frames must be positive")
         self.source = str(source)
         self.max_frames = max_frames
+        self.pace = pace
         self.is_rtsp = self.source.lower().startswith(("rtsp://", "rtsps://"))
         self._capture: cv2.VideoCapture | None = None
         self.metadata: VideoMetadata | None = None
@@ -50,6 +53,8 @@ class OpenCVVideoSource:
             self.open()
         assert self._capture is not None
         assert self.metadata is not None
+        wall_started = time.monotonic()
+        media_started: float | None = None
 
         while True:
             if self.max_frames is not None and self._next_frame_id >= self.max_frames:
@@ -68,6 +73,13 @@ class OpenCVVideoSource:
                 if source_ms > 0
                 else frame_id / self.metadata.fps
             )
+            if self.pace and not self.is_rtsp:
+                if media_started is None:
+                    media_started = source_timestamp
+                due = wall_started + source_timestamp - media_started
+                delay = due - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
             yield FramePacket(
                 frame_id=frame_id,
                 source_timestamp=source_timestamp,

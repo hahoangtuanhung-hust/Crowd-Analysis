@@ -1,5 +1,33 @@
 {
+  "coordinate_space": "pixel_space",
   "image_width": 1280,
   "image_height": 720,
-  "zones": []
+  "provenance": "Crossing zones defined for the 1280x720 Shibuya scramble camera view.",
+  "zones": [
+    {
+      "id": "north_crossing",
+      "name": "North Tsutaya Crosswalk",
+      "points": [[360, 80], [920, 80], [920, 260], [360, 260]]
+    },
+    {
+      "id": "south_crossing",
+      "name": "South Station Crosswalk",
+      "points": [[180, 480], [1100, 480], [1100, 720], [180, 720]]
+    },
+    {
+      "id": "west_crossing",
+      "name": "West Dogenzaka Crosswalk",
+      "points": [[0, 200], [380, 200], [380, 520], [0, 520]]
+    },
+    {
+      "id": "east_crossing",
+      "name": "East Station Plaza",
+      "points": [[900, 180], [1280, 180], [1280, 520], [900, 520]]
+    },
+    {
+      "id": "center_scramble",
+      "name": "Center Scramble",
+      "points": [[350, 260], [930, 260], [930, 490], [350, 490]]
+    }
+  ]
 }
