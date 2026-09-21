@@ -3,20 +3,44 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import statistics
 import time
 from collections import deque
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import cv2
 import numpy as np
+import psutil
 
-from backend.app.analytics import CompletedTracklet, PointTrackletManager
-from backend.app.core.config import ZoneConfig, load_config
+from backend.app.analytics import (
+    CommonPathAnalyzer,
+    CompletedTracklet,
+    PointTrackletManager,
+    SpatialTransformer,
+)
+from backend.app.analytics.ddcrp import DDCRPClustering
+from backend.app.artifacts import (
+    POINT_TRACKING_ARTIFACTS,
+    point_tracking_artifact_paths,
+    validate_point_tracking_artifacts,
+)
+from backend.app.core.config import AnalyticsConfig, ZoneConfig, load_config
 from backend.app.inference import UltralyticsPersonDetector
 from backend.app.tracking import ByteTrackTracker
+from backend.app.video import FrameRenderer, OverlayOptions
 
-CSV_FIELDS = ("camera_id", "track_id", "frame_id", "timestamp", "x", "y", "zone_id")
+CSV_FIELDS = (
+    "camera_id",
+    "track_id",
+    "frame_id",
+    "timestamp",
+    "x",
+    "y",
+    "confidence",
+    "zone_id",
+)
 FRAME_FIELDS = (
     "frame_id",
     "raw_person_detections",
@@ -25,6 +49,38 @@ FRAME_FIELDS = (
     "lost_tracks",
     "processing_fps",
     "inference_ms",
+)
+TIMELINE_FIELDS = (
+    "timestamp",
+    "path_id",
+    "state",
+    "score",
+    "confidence",
+    "unique_tracks_short",
+    "unique_tracks_long",
+)
+BENCHMARK_FIELDS = (
+    "input_fps",
+    "processing_fps",
+    "inference_ms",
+    "tracking_ms",
+    "analytics_ms",
+    "render_ms",
+    "encoding_ms",
+    "common_path_compute_ms",
+    "common_path_compute_ms_p95",
+    "end_to_end_latency_ms",
+    "frame_queue_size",
+    "analytics_queue_size",
+    "dropped_frames",
+    "active_tracks",
+    "completed_tracks",
+    "valid_tracks",
+    "common_path_switches",
+    "candidate_rejections",
+    "cpu_percent",
+    "ram_mb",
+    "gpu_memory_mb",
 )
 
 
@@ -55,6 +111,7 @@ def load_zones(path: Path, width: int, height: int) -> tuple[ZoneConfig, ...]:
             ZoneConfig(
                 zone_id=str(zone_id),
                 name=str(item.get("name", zone_id)),
+                zone_type=str(item.get("type", "area")),
                 points=[
                     (float(x) * scale_x, float(y) * scale_y) for x, y in item["points"]
                 ],
@@ -128,71 +185,6 @@ def draw_completed_route(layer: np.ndarray, tracklet: CompletedTracklet) -> None
     )
 
 
-def render_live_frame(
-    frame: np.ndarray,
-    tracks,
-    histories,
-    zones: tuple[ZoneConfig, ...],
-    *,
-    processing_fps: float,
-    latency_ms: float,
-) -> np.ndarray:
-    rendered = frame.copy()
-    draw_zones(rendered, zones)
-    for track in tracks:
-        history = histories.get(track.track_id, ())
-        if len(history) >= 2:
-            points = np.asarray([(round(p.x), round(p.y)) for p in history], dtype=np.int32)
-            cv2.polylines(
-                rendered,
-                [points.reshape((-1, 1, 2))],
-                False,
-                (52, 211, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            if len(points) >= 3:
-                cv2.arrowedLine(
-                    rendered,
-                    tuple(points[-3]),
-                    tuple(points[-1]),
-                    (52, 211, 255),
-                    2,
-                    cv2.LINE_AA,
-                    tipLength=0.35,
-                )
-        if history:
-            point = (round(history[-1].x), round(history[-1].y))
-        else:
-            x, y = track.bottom_center
-            point = (round(x), round(y))
-        cv2.circle(rendered, point, 5, (64, 202, 142), -1, cv2.LINE_AA)
-        cv2.circle(rendered, point, 7, (245, 247, 250), 1, cv2.LINE_AA)
-        cv2.putText(
-            rendered,
-            f"ID {track.track_id}",
-            (point[0] + 8, max(18, point[1] - 7)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-    label = f"People {len(tracks)}   FPS {processing_fps:.1f}   Latency {latency_ms:.0f} ms"
-    cv2.rectangle(rendered, (12, 12), (430, 46), (15, 20, 25), -1)
-    cv2.putText(
-        rendered,
-        label,
-        (22, 36),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        (245, 247, 250),
-        2,
-        cv2.LINE_AA,
-    )
-    return rendered
-
-
 def main() -> int:
     args = parse_args()
     source = Path(args.source)
@@ -200,7 +192,10 @@ def main() -> int:
         raise FileNotFoundError(f"Video does not exist: {source}")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_paths = point_tracking_artifact_paths(output_dir)
     config = load_config(args.config)
+    process_monitor = psutil.Process()
+    process_monitor.cpu_percent(interval=None)
 
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
@@ -209,19 +204,30 @@ def main() -> int:
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     source_fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     zones = load_zones(Path(args.zones), width, height)
+    analytics_data = config.analytics.model_dump()
+    analytics_data["zones"] = [zone.model_dump() for zone in zones]
+    analytics_config = AnalyticsConfig.model_validate(analytics_data)
     detector = UltralyticsPersonDetector(config.detector)
     tracker = ByteTrackTracker(config.tracker)
     tracklets = PointTrackletManager(
-        config.analytics,
+        analytics_config,
         config.tracker,
         zones,
         camera_id=args.camera_id,
     )
+    common_path = CommonPathAnalyzer(
+        analytics_config,
+        SpatialTransformer.pixel(width, height),
+    )
+    ddcrp_clustering = DDCRPClustering(analytics_config)
+    transformer = SpatialTransformer.pixel(width, height)
+    video_renderer = FrameRenderer(config.visualization)
+    production_overlay = OverlayOptions.from_visualization(config.visualization)
     density = np.zeros(
         (config.analytics.grid_height, config.analytics.grid_width), dtype=np.float32
     )
 
-    video_path = output_dir / "tracked_points.mp4"
+    video_path = artifact_paths["realtime_point_common_path.mp4"]
     video_writer = cv2.VideoWriter(
         str(video_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -232,10 +238,13 @@ def main() -> int:
         capture.release()
         raise RuntimeError(f"Unable to create output video: {video_path}")
     trajectory_writer = BatchedCsvWriter(
-        output_dir / "trajectories.csv", CSV_FIELDS, args.batch_size
+        artifact_paths["trajectories.csv"], CSV_FIELDS, args.batch_size
     )
     frame_writer = BatchedCsvWriter(
-        output_dir / "frame_metrics.csv", FRAME_FIELDS, args.batch_size
+        artifact_paths["frame_metrics.csv"], FRAME_FIELDS, args.batch_size
+    )
+    timeline_writer = BatchedCsvWriter(
+        artifact_paths["common_path_timeline.csv"], TIMELINE_FIELDS, args.batch_size
     )
 
     route_layer = np.zeros((height, width, 3), dtype=np.uint8)
@@ -245,6 +254,10 @@ def main() -> int:
     seen_ids: set[int] = set()
     measured_inference: list[float] = []
     measured_processing: list[float] = []
+    measured_tracking: list[float] = []
+    measured_analytics: list[float] = []
+    measured_render: list[float] = []
+    measured_encoding: list[float] = []
     raw_counts: list[int] = []
     active_counts: list[int] = []
     frame_id = 0
@@ -272,6 +285,42 @@ def main() -> int:
             seen_ids.update(active_ids)
             timestamp = frame_id / source_fps
             update = tracklets.update(tracks, frame_id=frame_id, timestamp=timestamp)
+            analytics_started = time.perf_counter()
+            if analytics_config.ddcrp_enabled:
+                from backend.app.schemas import Trajectory, TrackPoint
+                trajectories = []
+                for track_id in active_ids:
+                    pts = tracklets._histories.get(track_id)
+                    state = tracklets._states.get(track_id)
+                    if pts and state and state.confirmed:
+                        track_points = tuple(
+                            TrackPoint(
+                                track_id=track_id,
+                                timestamp=p.timestamp,
+                                frame_id=p.frame_id,
+                                x=p.x,
+                                y=p.y,
+                                raw_x=p.x,
+                                raw_y=p.y,
+                                confidence=p.confidence
+                            ) for p in pts
+                        )
+                        trajectories.append(Trajectory(
+                            track_id=track_id,
+                            points=track_points,
+                            age=state.accepted_count,
+                            confirmed=state.confirmed,
+                            last_seen_timestamp=timestamp
+                        ))
+                ddcrp_clustering.observe_all(trajectories, timestamp=timestamp)
+                common_snapshot = ddcrp_clustering.snapshot()
+            else:
+                common_snapshot = common_path.process_points(
+                    update.accepted_points,
+                    active_track_ids=active_ids,
+                    timestamp=timestamp,
+                )
+            analytics_ms = (time.perf_counter() - analytics_started) * 1000.0
             for point in update.persist_points:
                 trajectory_writer.add(point.as_csv_row())
                 column = min(
@@ -299,20 +348,36 @@ def main() -> int:
                 }
             )
             histories = tracklets.histories(active_ids)
-            video_writer.write(
-                render_live_frame(
-                    frame,
-                    tracks,
-                    histories,
-                    zones,
-                    processing_fps=processing_fps,
-                    latency_ms=inference_ms + tracking_ms,
-                )
+            current_points = tuple(
+                history[-1]
+                for history in histories.values()
+                if history
             )
+            render_started = time.perf_counter()
+            rendered = video_renderer.render_point_only_frame(
+                frame,
+                current_points,
+                common_snapshot,
+                zones,
+                transformer,
+                production_overlay,
+                people_count=len(tracks),
+                processing_fps=processing_fps,
+                latency_ms=inference_ms + tracking_ms + analytics_ms,
+                timestamp=timestamp,
+            )
+            render_ms = (time.perf_counter() - render_started) * 1000.0
+            encoding_started = time.perf_counter()
+            video_writer.write(rendered)
+            encoding_ms = (time.perf_counter() - encoding_started) * 1000.0
             raw_counts.append(len(detections))
             active_counts.append(len(active_ids))
             measured_inference.append(inference_ms)
             measured_processing.append(processing_ms)
+            measured_tracking.append(tracking_ms)
+            measured_analytics.append(analytics_ms)
+            measured_render.append(render_ms)
+            measured_encoding.append(encoding_ms)
             previous_ids = active_ids
             frame_id += 1
             if frame_id % 100 == 0:
@@ -327,7 +392,15 @@ def main() -> int:
             draw_completed_route(route_layer, completed)
         trajectory_writer.close()
         frame_writer.close()
+        final_snapshot = common_path.finalize_all(
+            max(0.0, (frame_id - 1) / source_fps)
+        )
+        for item in common_path.timeline():
+            timeline_writer.add(asdict(item))
+        timeline_writer.close()
         video_writer.release()
+
+    shutil.copyfile(video_path, artifact_paths["tracked_points.mp4"])
 
     if frame_id == 0 or background is None:
         raise RuntimeError("Input video contains no decodable frames")
@@ -361,7 +434,32 @@ def main() -> int:
             1,
             cv2.LINE_AA,
         )
-    cv2.imwrite(str(output_dir / "path_map.png"), path_map)
+    if not cv2.imwrite(str(artifact_paths["path_map.png"]), path_map):
+        raise RuntimeError("Unable to write path_map.png")
+
+    common_path_map = cv2.addWeighted(
+        background, 0.30, np.zeros_like(background), 0.70, 0.0
+    )
+    map_overlay = replace(
+        production_overlay,
+        points=False,
+        zones=True,
+        debug_metrics=False,
+    )
+    common_path_map = FrameRenderer(config.visualization).render_point_only_frame(
+        common_path_map,
+        (),
+        final_snapshot,
+        zones,
+        transformer,
+        map_overlay,
+        people_count=0,
+        processing_fps=0.0,
+        latency_ms=0.0,
+        timestamp=max(0.0, (frame_id - 1) / source_fps),
+    )
+    if not cv2.imwrite(str(artifact_paths["common_path_map.png"]), common_path_map):
+        raise RuntimeError("Unable to write common_path_map.png")
 
     smoothed_density = density
     if config.analytics.gaussian_sigma > 0:
@@ -380,9 +478,55 @@ def main() -> int:
     heatmap_full = cv2.resize(heatmap_small, (width, height), interpolation=cv2.INTER_LINEAR)
     heatmap_output = cv2.addWeighted(background, 0.35, heatmap_full, 0.65, 0.0)
     draw_zones(heatmap_output, zones)
-    cv2.imwrite(str(output_dir / "heatmap.png"), heatmap_output)
+    if not cv2.imwrite(str(artifact_paths["heatmap.png"]), heatmap_output):
+        raise RuntimeError("Unable to write heatmap.png")
 
     processing_seconds = sum(measured_processing) / 1000.0
+    directed_flows = common_path.flow_snapshot()
+    artifact_paths["edge_flows.json"].write_text(
+        json.dumps(asdict(directed_flows), indent=2), encoding="utf-8"
+    )
+    artifact_paths["common_paths.json"].write_text(
+        json.dumps(asdict(final_snapshot), indent=2), encoding="utf-8"
+    )
+    common_metrics = common_path.metrics()
+    benchmark_writer = BatchedCsvWriter(
+        artifact_paths["realtime_benchmark.csv"], BENCHMARK_FIELDS, 1
+    )
+    benchmark_writer.add(
+        {
+            "input_fps": round(source_fps, 4),
+            "processing_fps": round(frame_id / processing_seconds, 4),
+            "inference_ms": round(statistics.fmean(measured_inference), 4),
+            "tracking_ms": round(statistics.fmean(measured_tracking), 4),
+            "analytics_ms": round(statistics.fmean(measured_analytics), 4),
+            "render_ms": round(statistics.fmean(measured_render), 4),
+            "encoding_ms": round(statistics.fmean(measured_encoding), 4),
+            "common_path_compute_ms": common_metrics["common_path_compute_ms"],
+            "common_path_compute_ms_p95": common_metrics[
+                "common_path_compute_ms_p95"
+            ],
+            "end_to_end_latency_ms": round(
+                statistics.fmean(measured_processing)
+                + statistics.fmean(measured_analytics)
+                + statistics.fmean(measured_render)
+                + statistics.fmean(measured_encoding),
+                4,
+            ),
+            "frame_queue_size": 0,
+            "analytics_queue_size": 0,
+            "dropped_frames": 0,
+            "active_tracks": common_metrics["active_tracks"],
+            "completed_tracks": common_metrics["completed_tracks"],
+            "valid_tracks": common_metrics["valid_tracks"],
+            "common_path_switches": common_metrics["common_path_switches"],
+            "candidate_rejections": common_metrics["candidate_rejections"],
+            "cpu_percent": process_monitor.cpu_percent(interval=None),
+            "ram_mb": round(process_monitor.memory_info().rss / (1024 * 1024), 2),
+            "gpu_memory_mb": "",
+        }
+    )
+    benchmark_writer.close()
     summary = {
         "input": str(source.resolve()),
         "frames": frame_id,
@@ -398,10 +542,14 @@ def main() -> int:
         "completed_tracklets": tracklets.completed_tracklets,
         "discarded_short_tracklets": tracklets.discarded_short_tracklets,
         "zone_flows": flows,
+        "common_paths": [asdict(path) for path in final_snapshot.paths],
+        "common_path_metrics": common_metrics,
+        "artifacts": list(POINT_TRACKING_ARTIFACTS),
     }
-    (output_dir / "zone_flows.json").write_text(
+    artifact_paths["zone_flows.json"].write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+    validate_point_tracking_artifacts(output_dir)
     print(json.dumps(summary, indent=2))
     return 0
 
