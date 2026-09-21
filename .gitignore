@@ -39,3 +39,5 @@ models/*
 
 .env
 *.log
+
+.env.*
