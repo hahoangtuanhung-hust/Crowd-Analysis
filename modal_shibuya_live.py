@@ -169,6 +169,9 @@ def live_api():
                     raise ValueError("First command must be start")
                 duration = float(command.get("duration_seconds", LIVE_DURATION_SECONDS))
                 preview_fps = float(command.get("preview_fps", 10))
+                max_paths = command.get("max_paths", 3)
+                if isinstance(max_paths, bool) or not isinstance(max_paths, int) or not 1 <= max_paths <= 5:
+                    raise ValueError("max_paths must be an integer in [1, 5]")
                 run_id = str(command.get("run_id", ""))
                 client_kind = str(command.get("client_kind", "unknown"))
                 if not 1 <= duration <= LIVE_DURATION_SECONDS:
@@ -212,6 +215,7 @@ def live_api():
                     device_name=torch.cuda.get_device_name(0),
                     stop_event=stop_event,
                     processing_mode="realtime_pts",
+                    max_paths=max_paths,
                 )
 
                 async def receive_controls() -> None:
@@ -222,6 +226,12 @@ def live_api():
                         if action == "stop":
                             next_sequence("browser_stop")
                             stop_event.set()
+                        elif action == "set_max_paths":
+                            try:
+                                value = processor.set_max_paths(message.get("max_paths"))
+                                await send_event("max_paths_applied", applied_max_paths=value)
+                            except ValueError as exc:
+                                await send_event("control_error", message=str(exc))
                         elif action == "frame_ack" and first_client_ack_seq is None:
                             first_client_ack_seq = next_sequence(
                                 "first_client_frame_ack",

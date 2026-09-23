@@ -1,4 +1,4 @@
-"""Bounded GPU clip run or CPU analytics replay. Never infer on the local replay path."""
+"""GPU video run or CPU analytics replay. Never infer on the local replay path."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import yaml
 
 from backend.app.analytics.common_path import CommonPathAnalyzer
 from backend.app.analytics.directional_grid import DirectionalGridEngine, GridTrackPoint
+from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
 from backend.app.analytics.spatial import SpatialTransformer
 from backend.app.core.config import load_config
 from backend.app.schemas import Detection, TrackedObject
@@ -35,7 +36,7 @@ def digest(path: Path) -> str:
 
 
 def cache_key(input_hash: str, model_hash: str, config: object, start: float,
-              duration: float) -> str:
+              duration: float | None) -> str:
     data = dict(schema="detections-tracklets-v1", input_hash=input_hash,
                 model_hash=model_hash, start=start, duration=duration,
                 detector=config.detector.model_dump(exclude={"device", "model"}),
@@ -44,12 +45,14 @@ def cache_key(input_hash: str, model_hash: str, config: object, start: float,
 
 
 def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Path | None,
-        start_seconds: float, duration_seconds: float, run_id: str, engine: str,
+        start_seconds: float, duration_seconds: float | None, run_id: str, engine: str,
         replay_cache: Path | None = None, input_hash: str | None = None,
         model_hash: str | None = None, rebuild_tracks: bool = False) -> dict:
-    if not (0 <= start_seconds and 0 < duration_seconds <= 90):
-        raise ValueError("Clip must be positive, <=90 seconds, and start >=0")
-    if engine not in ("legacy", "directional_grid", "shadow"):
+    if start_seconds < 0:
+        raise ValueError("Start must be >=0 seconds")
+    if duration_seconds is not None and duration_seconds <= 0:
+        raise ValueError("Duration must be >0 seconds when provided")
+    if engine not in ("legacy", "directional_grid", "tracklet_aggregation", "shadow"):
         raise ValueError("Invalid engine")
     if output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite run: {output_dir}")
@@ -66,6 +69,13 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     transformer = SpatialTransformer.pixel(width, height)
     grid = DirectionalGridEngine(config.analytics.directional_grid, transformer,
                                  stream_epoch=run_id, zones=config.analytics.zones)
+    tracklet = TrackletAggregationEngine(
+        config.analytics.common_path.tracklet_aggregation,
+        transformer,
+        camera_id="cam01",
+        stream_epoch=run_id,
+        max_paths=config.analytics.common_path.max_paths,
+    )
     legacy = CommonPathAnalyzer(config.analytics, transformer)
     selected = config.analytics.common_path.shadow_display if engine == "shadow" else engine
     renderer = FrameRenderer(config.visualization)
@@ -116,8 +126,9 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     last_frame: np.ndarray | None = None
     last_time = start_seconds
     start_frame = round(start_seconds * fps)
-    end_frame = min(round((start_seconds + duration_seconds) * fps),
-                    int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 10**9)
+    source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 10**9
+    end_frame = source_frame_count if duration_seconds is None else min(
+        round((start_seconds + duration_seconds) * fps), source_frame_count)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     cache_reader = replay_cache.open("r", encoding="utf-8") if replay_cache else None
     cache_writer = cache_path.open("w", encoding="utf-8") if replay_cache is None else None
@@ -176,7 +187,10 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                      timestamp, *t.bottom_center, observed=t.observed)
                       for t in tracks]
             t2 = time.perf_counter()
-            latest_snapshot = grid.update(points, timestamp)
+            if engine in ("directional_grid", "shadow"):
+                latest_snapshot = grid.update(points, timestamp)
+            elif engine == "tracklet_aggregation":
+                latest_snapshot = tracklet.update(points, timestamp)
             directional_ms = (time.perf_counter() - t2) * 1000
             legacy_ms = 0.
             if engine in ("legacy", "shadow"):
@@ -249,7 +263,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         cv2.imwrite(str(output_dir / "preview_contact_sheet.jpg"), sheet)
     assert first_frame is not None and last_frame is not None
     cv2.imwrite(str(output_dir / "common_path_map.png"), renderer.render_point_only_frame(
-        last_frame, (), latest_snapshot if selected == "directional_grid" else legacy_snapshot,
+        last_frame, (), latest_snapshot if selected in ("directional_grid", "tracklet_aggregation") else legacy_snapshot,
         tuple(config.analytics.zones), transformer, overlay,
         people_count=0, processing_fps=0, latency_ms=0, timestamp=last_time))
     for image_name in ("directional_field_debug.png", "edge_flow_debug.png"):
@@ -275,7 +289,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                 cv2.arrowedLine(debug,scale(a),scale(b),(40,220,40),
                                 max(1,min(4,edge.unique_tracks_long)),tipLength=.4)
         cv2.imwrite(str(output_dir / image_name), debug)
-    path_events = list(grid.events)
+    path_events = list(tracklet.events) if engine == "tracklet_aggregation" else list(grid.events)
     if not path_events:
         path_events.append(dict(
             event="insufficient_data",
@@ -293,6 +307,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     def p95(field: str) -> float:
         return round(float(np.percentile([t[field] for t in timings], 95)), 3)
     switch_count = sum(event["event"] == "switch" for event in path_events)
+    media_duration = max(last_time - start_seconds, 1e-9)
     summary = dict(run_type="analytics_replay" if replay_cache else "gpu_pipeline",
                    engine=engine, selected_display=selected, frames=len(frame_ids),
                    first_frame=frame_ids[0], last_frame=frame_ids[-1],
@@ -304,7 +319,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    result="active" if latest_snapshot.paths else "insufficient_data",
                    active_paths=[asdict(p) for p in latest_snapshot.paths],
                    legacy_paths=[asdict(p) for p in legacy_snapshot.paths] if engine != "directional_grid" else [],
-                   directional_edges=len(grid.flow_snapshot().edges),
+                   directional_edges=len(grid.flow_snapshot().edges) if engine != "tracklet_aggregation" else 0,
                    support_cap_drops=grid.overflow,
                    rejected_jump_segments=grid.rejected_jumps,
                    analytics_p50_ms=p50("analytics_ms"), analytics_p95_ms=p95("analytics_ms"),
@@ -316,7 +331,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    directional_analytics_p95_ms=p95("directional_analytics_ms"),
                    legacy_analytics_p95_ms=p95("legacy_analytics_ms"),
                    path_switches=switch_count,
-                   switches_per_minute=round(switch_count / (duration_seconds / 60), 3),
+                   switches_per_minute=round(switch_count / (media_duration / 60), 3),
                    validated_route_support=[path.validated_complete_tracks
                                             for path in latest_snapshot.paths],
                    polyline_jitter_px=None,
@@ -356,8 +371,9 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--start-seconds", type=float, default=0.)
-    parser.add_argument("--duration-seconds", type=float, default=25.)
-    parser.add_argument("--engine", choices=("legacy","directional_grid","shadow"), default="directional_grid")
+    parser.add_argument("--duration-seconds", type=float,
+                        help="Optional processing limit; omit to process through end of input")
+    parser.add_argument("--engine", choices=("legacy", "directional_grid", "tracklet_aggregation", "shadow"), default="directional_grid")
     parser.add_argument("--replay-cache", type=Path)
     parser.add_argument("--source-hash")
     parser.add_argument("--model-hash")

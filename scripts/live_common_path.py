@@ -22,6 +22,7 @@ import yaml
 
 from backend.app.analytics.directional_grid import DirectionalGridEngine, GridTrackPoint
 from backend.app.analytics.dominant_live_flow import DominantLiveFlowEngine
+from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
 from backend.app.analytics.spatial import SpatialTransformer
 from backend.app.core.config import load_config
 from backend.app.schemas import Detection, TrackedObject
@@ -94,6 +95,7 @@ class LiveCommonPathProcessor:
         device_name: str = "unknown",
         stop_event: threading.Event | None = None,
         processing_mode: str = "inspect_all_frames",
+        max_paths: int | None = None,
     ) -> None:
         if processing_mode not in {"inspect_all_frames", "realtime_pts"}:
             raise ValueError("processing_mode must be inspect_all_frames or realtime_pts")
@@ -112,6 +114,18 @@ class LiveCommonPathProcessor:
         self.stop_event = stop_event or threading.Event()
         self.processing_mode = processing_mode
         self.final_manifest: dict[str, Any] | None = None
+        self.max_paths = max_paths
+        self._engine_lock = threading.RLock()
+        self._engine: Any | None = None
+
+    def set_max_paths(self, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+            raise ValueError("max_paths must be an integer in [1, 5]")
+        with self._engine_lock:
+            self.max_paths = value
+            if isinstance(self._engine, TrackletAggregationEngine):
+                self._engine.set_max_paths(value)
+        return value
 
     def frames(self) -> Iterator[tuple[dict[str, Any], bytes]]:
         boot_started = time.perf_counter()
@@ -139,8 +153,15 @@ class LiveCommonPathProcessor:
             raise ValueError("Source video metadata is incomplete")
         limit = min(source_frames, max(1, round(self.duration_seconds * fps)))
         transformer = SpatialTransformer.pixel(width, height)
-        dominant_mode = config.analytics.dominant_live_flow.mode == "dominant_live_flow"
-        if dominant_mode:
+        tracklet_mode = config.analytics.common_path.engine == "tracklet_aggregation"
+        dominant_mode = not tracklet_mode and config.analytics.dominant_live_flow.mode == "dominant_live_flow"
+        if tracklet_mode:
+            engine = TrackletAggregationEngine(config.analytics.common_path.tracklet_aggregation,
+                                               transformer, camera_id="shibuya-01",
+                                               stream_epoch=self.stream_epoch,
+                                               max_paths=self.max_paths or config.analytics.common_path.max_paths)
+            route_scope = "tracklet_aggregation"
+        elif dominant_mode:
             engine: Any = DominantLiveFlowEngine(
                 config.analytics.dominant_live_flow,
                 transformer,
@@ -159,6 +180,8 @@ class LiveCommonPathProcessor:
                 variant="live_inference",
             )
             route_scope = config.analytics.directional_grid.route_scope
+        with self._engine_lock:
+            self._engine = engine
         tracker = ByteTrackTracker(config.tracker)
         renderer = FrameRenderer(config.visualization)
         overlay = OverlayOptions(
@@ -305,7 +328,9 @@ class LiveCommonPathProcessor:
                     for track in tracks
                 ]
                 analytics_started = time.perf_counter()
-                snapshot = engine.update(points, media_s)
+                with self._engine_lock:
+                    snapshot = engine.update(points, media_s)
+                    applied_k = engine.max_paths if tracklet_mode else 1
                 analytics_ms = (time.perf_counter() - analytics_started) * 1000
                 path, path_state, reason = _path_payload(snapshot)
                 if dominant_mode:
@@ -327,7 +352,8 @@ class LiveCommonPathProcessor:
                     challenger_count = 0
                     challenger_direction = None
                     confirmation_elapsed_s = 0.0
-                    confirmation_required_s = config.analytics.directional_grid.confirmation_seconds
+                    confirmation_required_s = (config.analytics.common_path.tracklet_aggregation.confirmation_seconds
+                                               if tracklet_mode else config.analytics.directional_grid.confirmation_seconds)
                     moving_track_count = 0
                 active_path = path if path_state in {"active", "cooling"} else None
                 current_points = [
@@ -351,7 +377,7 @@ class LiveCommonPathProcessor:
                     processing_fps=detector_calls / elapsed,
                     latency_ms=inference_ms,
                     timestamp=media_s,
-                    directed_flows=engine.flow_snapshot() if hasattr(engine, "flow_snapshot") else (),
+                    directed_flows=engine.flow_snapshot() if hasattr(engine, "flow_snapshot") else None,
                 )
                 render_ms = (time.perf_counter() - render_started) * 1000
                 encode_started = time.perf_counter()
@@ -377,8 +403,10 @@ class LiveCommonPathProcessor:
                     "evidence_until_s": (
                         active_path["evidence_until_s"] if active_path else snapshot.evidence_until_s
                     ),
+                    "applied_max_paths": applied_k,
                 }) + "\n")
                 signature = (
+                    applied_k,
                     active_path["path_id"] if active_path else None,
                     active_path["revision"] if active_path else None,
                     path_state,
@@ -389,6 +417,8 @@ class LiveCommonPathProcessor:
                 )
                 if signature != last_timeline_signature or media_s - last_timeline_s >= 1.0:
                     timeline_file.write(json.dumps({
+                        "camera_id": "shibuya-01",
+                        "stream_epoch": self.stream_epoch,
                         "media_time_s": media_s,
                         "frame_id": source_frame_id,
                         "path_id": active_path["path_id"] if active_path else None,
@@ -403,6 +433,8 @@ class LiveCommonPathProcessor:
                         "confirmation_elapsed_s": round(confirmation_elapsed_s, 3),
                         "confirmation_required_s": confirmation_required_s,
                         "polyline": active_path["polyline"] if active_path else [],
+                        "paths": [asdict(item) for item in snapshot.paths],
+                        "applied_max_paths": applied_k,
                         "evidence_until_s": (
                             active_path["evidence_until_s"] if active_path else snapshot.evidence_until_s
                         ),
@@ -475,6 +507,9 @@ class LiveCommonPathProcessor:
                         "confirmation_required_s": confirmation_required_s,
                         "moving_track_count": moving_track_count,
                         "common_path": active_path,
+                        "paths": [asdict(item) for item in snapshot.paths],
+                        "applied_max_paths": applied_k,
+                        "camera_id": "shibuya-01",
                         "processing_fps": detector_calls / elapsed,
                         "preview_fps": preview_count / elapsed,
                         "source_fps": fps,
@@ -565,6 +600,9 @@ class LiveCommonPathProcessor:
                 "inference_p95_ms": _percentile(metrics_rows, "inference_ms"),
                 "tracking_p95_ms": _percentile(metrics_rows, "tracking_ms"),
                 "analytics_p95_ms": _percentile(metrics_rows, "analytics_ms"),
+                "analytics_p50_ms": _percentile(metrics_rows, "analytics_ms", 50),
+                "candidate_count": getattr(engine, "candidate_count", 0),
+                "candidate_rejections": dict(getattr(engine, "rejections", {})),
                 "render_p95_ms": _percentile(metrics_rows, "render_ms"),
                 "encode_p95_ms": _percentile(metrics_rows, "encode_ms"),
             }
@@ -578,7 +616,7 @@ class LiveCommonPathProcessor:
                 "source": self.source_name,
                 "input_hash": input_hash,
                 "model_hash": model_hash,
-                "mode": "dominant_live_flow" if dominant_mode else "validated_route",
+                "mode": "tracklet_aggregation" if tracklet_mode else "dominant_live_flow" if dominant_mode else "validated_route",
                 "processing_mode": self.processing_mode,
                 "device": self.device_name,
                 "detector_calls": detector_calls,

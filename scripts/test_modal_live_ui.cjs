@@ -19,9 +19,10 @@ fs.mkdirSync(output, { recursive: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const record = {
     url,
-    topology: 'Chrome -> Vite UI -> authenticated WSS -> Modal T4 ASGI -> YOLO/ByteTrack/dominant_live_flow/render',
+    topology: 'Chrome -> Vite UI -> authenticated WSS -> Modal T4 ASGI -> YOLO/ByteTrack/tracklet_aggregation/render',
     browser: `Chrome ${browser.version()}`,
     frames: [],
+    k_samples: [],
     console_errors: [],
     failed_requests: [],
     http_errors: [],
@@ -54,6 +55,22 @@ fs.mkdirSync(output, { recursive: true });
         image_sha256: crypto.createHash('sha256').update(image).digest('hex'),
         dimensions: await page.locator('.video-stage img').evaluate(img => [img.naturalWidth, img.naturalHeight]),
       });
+    }
+
+    for (const limit of [1, 3, 5]) {
+      await page.getByTestId('path-limit').selectOption(String(limit));
+      await page.waitForFunction(value => document.querySelector('[data-testid="path-limit"]')?.dataset.applied === String(value), limit, { timeout: 20000 });
+      const before = await page.getByTestId('modal-frame-meta').textContent();
+      await page.waitForFunction(previous => document.querySelector('[data-testid="modal-frame-meta"]')?.textContent !== previous, before, { timeout: 20000 });
+      const image = await page.locator('.video-stage img').screenshot();
+      const filename = `browser-k-${limit}.png`;
+      await page.locator('.video-stage').screenshot({ path: path.join(output, filename) });
+      record.k_samples.push({ limit, filename,
+        metadata: await page.getByTestId('modal-frame-meta').textContent(),
+        path_count: await page.locator('.paths-panel .path-list li').count(),
+        path_labels: await page.locator('.paths-panel .path-list li strong').allTextContents(),
+        colors: await page.locator('.paths-panel .path-swatch').evaluateAll(items => items.map(item => getComputedStyle(item).backgroundColor)),
+        image_sha256: crypto.createHash('sha256').update(image).digest('hex') });
     }
 
     for (const mediaSeconds of captureMediaSeconds) {
@@ -95,6 +112,9 @@ fs.mkdirSync(output, { recursive: true });
     record.disabled_overlay_count = await page.locator('.overlay-controls input:disabled').count();
     await page.screenshot({ path: path.join(output, 'browser-final-full.png'), fullPage: true });
     record.passed = record.frames.length >= 3
+      && record.k_samples.length === 3
+      && record.k_samples.every(item => item.path_count <= item.limit)
+      && new Set(record.k_samples.map(item => item.image_sha256)).size === 3
       && new Set(record.frames.map(item => item.image_sha256)).size === 3
       && record.frames.every(item => item.dimensions[0] === 1280 && item.dimensions[1] === 720)
       && record.alerts.length === 0

@@ -28,9 +28,9 @@ image = (
 
 
 @app.function(image=image, gpu="T4", volumes={"/root/data": volume},
-              max_containers=1, timeout=600, retries=0)
+              max_containers=1, timeout=3600, retries=0)
 def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds: float,
-             duration_seconds: float, engine: str, run_id: str) -> dict:
+             duration_seconds: float | None, engine: str, run_id: str) -> dict:
     import sys
     sys.path.insert(0, "/root")
     import torch
@@ -81,15 +81,17 @@ def _sha256(path: Path) -> str:
 
 @app.local_entrypoint()
 def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
-         duration_seconds: float = 25., engine: str = "directional_grid",
+         duration_seconds: float | None = None, engine: str = "directional_grid",
          mode: str = "offline_fast", config: str = "configs/default.yaml",
          run_id: str = "", cache_policy: str = "reuse") -> None:
     if mode != "offline_fast":
-        raise ValueError("The bounded batch runner only supports offline_fast; UI realtime is separate")
-    if cache_policy not in ("reuse", "refresh") or engine not in ("legacy", "directional_grid", "shadow"):
+        raise ValueError("The batch runner only supports offline_fast; UI realtime is separate")
+    if cache_policy not in ("reuse", "refresh") or engine not in ("legacy", "directional_grid", "tracklet_aggregation", "shadow"):
         raise ValueError("Invalid cache policy or engine")
-    if not 0 <= start_seconds or not 0 < duration_seconds <= 90:
-        raise ValueError("Duration must be within (0,90] seconds")
+    if start_seconds < 0:
+        raise ValueError("Start must be >=0 seconds")
+    if duration_seconds is not None and duration_seconds <= 0:
+        raise ValueError("Duration must be >0 seconds when provided")
     source, settings, model = Path(input), Path(config), Path("yolo26n.pt")
     for path in (source, settings, model):
         if not path.is_file():
