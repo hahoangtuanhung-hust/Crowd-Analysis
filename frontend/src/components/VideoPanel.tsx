@@ -17,6 +17,7 @@ interface VideoPanelProps {
   maxPaths?: number;
   appliedMaxPaths?: number;
   onMaxPathsChange?: (value: number) => void;
+  commonPathOnly?: boolean;
 }
 
 /**
@@ -24,7 +25,7 @@ interface VideoPanelProps {
  * hoặc hiện frame tĩnh cuối cùng khi session completed/stopped/error,
  * hoặc placeholder khi chưa có stream.
  */
-export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCalibrate, onZones, editable = true, runtime, modalMetadata, maxPaths, appliedMaxPaths, onMaxPathsChange }: VideoPanelProps) {
+export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCalibrate, onZones, editable = true, runtime, modalMetadata, maxPaths, appliedMaxPaths, onMaxPathsChange, commonPathOnly = false }: VideoPanelProps) {
   const status: SessionStatus | undefined = session?.status;
   const isLive = status === "running" || status === "starting";
 
@@ -75,9 +76,11 @@ export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCali
           <button className="icon-command" type="button" onClick={onCalibrate} disabled={!displayUrl || !editable} title="Perspective calibration">
             <Crosshair size={17} aria-hidden="true" /> Calibrate
           </button>
-          <button className="icon-command" type="button" onClick={onZones} disabled={!displayUrl || !editable} title="Edit zones">
-            <MapPinned size={17} aria-hidden="true" /> Zones
-          </button>
+          {!commonPathOnly && (
+            <button className="icon-command" type="button" onClick={onZones} disabled={!displayUrl || !editable} title="Edit zones">
+              <MapPinned size={17} aria-hidden="true" /> Zones
+            </button>
+          )}
         </div>
       </header>
       <div className="video-stage">
@@ -127,12 +130,12 @@ export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCali
         <Toggle label="Tracking Points" checked={overlay.points} disabled={!session || !editable} onChange={(value) => update("points", value)} />
         <Toggle label="Common Path" checked={overlay.active_paths} disabled={!session || !editable} onChange={(value) => update("active_paths", value)} />
         <Toggle label="Direction Arrows" checked={overlay.direction_arrows} disabled={!session || !overlay.active_paths || !editable} onChange={(value) => update("direction_arrows", value)} />
-        <Toggle label="Zones" checked={overlay.zones} disabled={!session || !editable} onChange={(value) => update("zones", value)} />
+        {!commonPathOnly && <Toggle label="Zones" checked={overlay.zones} disabled={!session || !editable} onChange={(value) => update("zones", value)} />}
         <Toggle label="Track IDs" checked={overlay.track_ids} disabled={!session || !editable} onChange={(value) => update("track_ids", value)} />
         <Toggle label="Individual Paths (debug)" checked={overlay.trajectory_tails} disabled={!session || !editable} onChange={(value) => update("trajectory_tails", value)} />
-        <Toggle label="Heatmap" checked={overlay.heatmap} disabled={!session || !editable} onChange={(value) => update("heatmap", value)} />
-        <Toggle label="Debug Grid" checked={overlay.grid} disabled={!session || !editable} onChange={(value) => update("grid", value)} />
-        <Toggle label="Debug Edge Flow" checked={overlay.edge_flows} disabled={!session || !editable} onChange={(value) => update("edge_flows", value)} />
+        {!commonPathOnly && <Toggle label="Heatmap" checked={overlay.heatmap} disabled={!session || !editable} onChange={(value) => update("heatmap", value)} />}
+        {!commonPathOnly && <Toggle label="Debug Grid" checked={overlay.grid} disabled={!session || !editable} onChange={(value) => update("grid", value)} />}
+        {!commonPathOnly && <Toggle label="Debug Edge Flow" checked={overlay.edge_flows} disabled={!session || !editable} onChange={(value) => update("edge_flows", value)} />}
         <Toggle label="Debug Candidate" checked={overlay.candidate_paths} disabled={!session || !editable} onChange={(value) => update("candidate_paths", value)} />
         <Toggle label="Metrics" checked={overlay.debug_metrics} disabled={!session || !editable} onChange={(value) => update("debug_metrics", value)} />
       </div>

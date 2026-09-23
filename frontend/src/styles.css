@@ -94,6 +94,7 @@ main { width: min(1500px, calc(100% - 40px)); margin: 0 auto; padding: 18px 0 40
 
 .primary-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(390px, 1fr); gap: 12px; }
 .secondary-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(390px, 1fr); gap: 12px; margin-top: 12px; }
+.primary-grid.common-path-only, .secondary-grid.common-path-only { grid-template-columns: minmax(0, 1fr); }
 .panel { min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); overflow: hidden; }
 .panel-header { min-height: 59px; padding: 11px 14px; display: flex; align-items: center; border-bottom: 1px solid var(--line); }
 .panel-header h2 { margin: 2px 0 0; font-size: 15px; line-height: 1.2; }

@@ -28,6 +28,9 @@ export interface RuntimeInfo {
   detector_workers?: number;
   last_cache_frame_id?: number;
   last_cache_timestamp_s?: number;
+  common_path_only?: boolean;
+  common_path_engine?: string;
+  default_max_paths?: number;
 }
 
 export interface ModalLiveMetadata {

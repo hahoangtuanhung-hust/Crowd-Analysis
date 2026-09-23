@@ -66,8 +66,8 @@ export function useModalLive() {
   const [error, setError] = useState<string | null>(modalConfiguration.error);
   const [identity, setIdentity] = useState({ sessionId: "", epoch: "" });
   const [data, setData] = useState<LiveSnapshot>(EMPTY_SNAPSHOT);
-  const [maxPaths, setMaxPaths] = useState(3);
-  const [appliedMaxPaths, setAppliedMaxPaths] = useState(3);
+  const [maxPaths, setMaxPaths] = useState(1);
+  const [appliedMaxPaths, setAppliedMaxPaths] = useState(1);
 
   useEffect(() => {
     if (!enabled) return;

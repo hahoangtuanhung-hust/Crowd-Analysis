@@ -112,7 +112,13 @@ export default function App() {
     }
   }, [status]);
 
-  const { heatmap, flow } = useSpatialData(metric, timeWindow, data.session?.frame_version ?? 0, !modalMode);
+  const commonPathOnly = runtime.common_path_only ?? false;
+  const { heatmap, flow } = useSpatialData(
+    metric,
+    timeWindow,
+    data.session?.frame_version ?? 0,
+    !modalMode && !commonPathOnly,
+  );
 
   const frameUrl = modalMode
     ? modalLive.frameUrl
@@ -180,11 +186,11 @@ export default function App() {
             <div className="completion-text">
               <h3>Phân tích video hoàn tất!</h3>
               <p>
-                Đã nhận diện tổng cộng <strong>{data.summary.unique_track_count}</strong> người, 
+                Đã nhận diện tổng cộng <strong>{data.summary.unique_track_count}</strong> người,
                 lưu lượng đỉnh <strong>{data.summary.peak_crowd_count}</strong> người cùng lúc.{" "}
                 {hasConfirmedCommonPath
-                  ? "Common Path và bản đồ nhiệt đã sẵn sàng xem bên dưới."
-                  : "Bản đồ nhiệt đã sẵn sàng; chưa có Common Path được xác nhận tại thời điểm kết thúc."}
+                  ? "Common Path đã sẵn sàng xem bên dưới."
+                  : "Chưa có Common Path được xác nhận tại thời điểm kết thúc."}
               </p>
             </div>
           </div>
@@ -210,7 +216,7 @@ export default function App() {
         <MetricStrip summary={data.summary} metrics={data.metrics} replayMode={runtime.mode === "replay"} />
 
         {/* Khung chính: Video trực tiếp & Bản đồ nhiệt Heatmap */}
-        <div className="primary-grid">
+        <div className={`primary-grid${commonPathOnly ? " common-path-only" : ""}`}>
           <VideoPanel
             session={data.session}
             frameUrl={frameUrl}
@@ -220,34 +226,39 @@ export default function App() {
             onZones={() => setEditor("zones")}
             editable={!modalMode}
             runtime={runtime}
+            commonPathOnly={commonPathOnly}
             modalMetadata={modalLive.metadata}
             maxPaths={modalMode ? modalLive.maxPaths : undefined}
             appliedMaxPaths={modalLive.appliedMaxPaths}
             onMaxPathsChange={modalLive.changeMaxPaths}
           />
 
-          <HeatmapPanel
-            data={heatmap}
-            metric={metric}
-            window={timeWindow}
-            onMetricChange={setMetric}
-            onWindowChange={setTimeWindow}
-          />
+          {!commonPathOnly && (
+            <HeatmapPanel
+              data={heatmap}
+              metric={metric}
+              window={timeWindow}
+              onMetricChange={setMetric}
+              onWindowChange={setTimeWindow}
+            />
+          )}
         </div>
 
         {/* Khung thứ 2: Pathmap (Trường vector Flow) & Top Common Paths */}
-        <div className="secondary-grid">
-          <FlowField data={flow} />
+        <div className={`secondary-grid${commonPathOnly ? " common-path-only" : ""}`}>
+          {!commonPathOnly && <FlowField data={flow} />}
           <PathsPanel paths={overlay.popular_paths ? data.common_paths : []} />
         </div>
 
         {/* Khung thứ 3: Biểu đồ số người theo thời gian & Phân bổ Zone */}
-        <div className="secondary-grid lower-grid">
-          <Suspense fallback={<section className="panel timeline-panel timeline-loading" aria-label="Loading crowd timeline" />}>
-            <TimelinePanel timeline={data.timeline} />
-          </Suspense>
-          <ZonesPanel zones={data.zones} flows={data.zone_flows ?? []} />
-        </div>
+        {!commonPathOnly && (
+          <div className="secondary-grid lower-grid">
+            <Suspense fallback={<section className="panel timeline-panel timeline-loading" aria-label="Loading crowd timeline" />}>
+              <TimelinePanel timeline={data.timeline} />
+            </Suspense>
+            <ZonesPanel zones={data.zones} flows={data.zone_flows ?? []} />
+          </div>
+        )}
       </main>
 
       {editor && frameUrl && (
