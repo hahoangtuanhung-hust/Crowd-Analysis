@@ -57,6 +57,8 @@ class CommonPath:
     validated_complete_tracks: int = 0
     evidence_until_s: float = 0.0
     stale: bool = False
+    color: str = ""
+    rank: int = 0
 
 
 @dataclass(frozen=True, slots=True)

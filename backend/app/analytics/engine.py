@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from backend.app.analytics.common_path import CommonPathAnalyzer
 from backend.app.analytics.ddcrp import DDCRPClustering
 from backend.app.analytics.directional_grid import DirectionalGridEngine, GridTrackPoint
+from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
 from backend.app.analytics.flow import FlowAnalyzer
 from backend.app.analytics.heatmap import HeatmapAnalyzer, HeatmapWindow
 from backend.app.analytics.spatial import SpatialTransformer
@@ -60,6 +61,10 @@ class AnalyticsEngine:
             config.directional_grid, transformer, camera_id=camera_id,
             stream_epoch=stream_epoch, zones=config.zones
         )
+        self.tracklet_path = TrackletAggregationEngine(
+            config.common_path.tracklet_aggregation, transformer, camera_id=camera_id,
+            stream_epoch=stream_epoch, max_paths=config.common_path.max_paths,
+        )
         self.ddcrp = DDCRPClustering(config)
         self._lock = threading.RLock()
         self._current_count = 0
@@ -91,6 +96,8 @@ class AnalyticsEngine:
                 and trajectory.points[-1].frame_id == result.packet.frame_id
             )
             engine_mode = self.config.common_path.engine
+            confirmed_ids = {trajectory.track_id for trajectory in trajectories
+                             if trajectory.confirmed}
             if engine_mode in ("legacy", "shadow"):
                 self.common_path.process_points(
                     latest_points,
@@ -98,8 +105,6 @@ class AnalyticsEngine:
                     timestamp=timestamp,
                 )
             if engine_mode in ("directional_grid", "shadow"):
-                confirmed_ids = {trajectory.track_id for trajectory in trajectories
-                                 if trajectory.confirmed}
                 self.directional_path.update(
                     (GridTrackPoint(self.camera_id, self.directional_path.stream_epoch,
                                     track.track_id, 0, result.packet.frame_id,
@@ -107,6 +112,14 @@ class AnalyticsEngine:
                      for track in result.tracks
                      if track.observed and track.track_id in confirmed_ids),
                     timestamp,
+                )
+            if engine_mode == "tracklet_aggregation":
+                self.tracklet_path.update(
+                    (GridTrackPoint(self.camera_id, self.tracklet_path.stream_epoch,
+                                    track.track_id, 0, result.packet.frame_id,
+                                    timestamp, *track.bottom_center, observed=track.observed)
+                     for track in result.tracks
+                     if track.track_id in confirmed_ids), timestamp,
                 )
             if self.config.ddcrp_enabled:
                 self.ddcrp.observe_all(trajectories, timestamp=timestamp)
@@ -178,6 +191,8 @@ class AnalyticsEngine:
 
     def common_path_snapshot(self) -> CommonPathSnapshot:
         with self._lock:
+            if self.config.common_path.engine == "tracklet_aggregation":
+                return self.tracklet_path.snapshot()
             if self.config.common_path.engine == "directional_grid" or (
                 self.config.common_path.engine == "shadow" and
                 self.config.common_path.shadow_display == "directional_grid"
@@ -189,12 +204,17 @@ class AnalyticsEngine:
 
     def common_path_flows(self) -> DirectedFlowSnapshot:
         with self._lock:
+            if self.config.common_path.engine == "tracklet_aggregation":
+                return self.directional_path.flow_snapshot()
             if self.config.common_path.engine in ("directional_grid", "shadow"):
                 return self.directional_path.flow_snapshot()
             return self.common_path.flow_snapshot()
 
     def common_path_metrics(self) -> dict[str, int | float | None]:
         with self._lock:
+            if self.config.common_path.engine == "tracklet_aggregation":
+                return {"tracklet_candidates": self.tracklet_path.candidate_count,
+                        "tracklet_active": len(self.tracklet_path.snapshot().paths)}
             if self.config.common_path.engine == "directional_grid":
                 return {"directional_tracks": len(self.directional_path._tracks),
                         "directional_retained_points": self.directional_path.retained_points,
