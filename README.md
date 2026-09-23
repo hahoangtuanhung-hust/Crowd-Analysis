@@ -109,7 +109,40 @@ modal run modal_app.py --output-dir output_modal
 tracking: `directional_grid` is the new validated engine, `shadow` runs both engines from the
 same observations and displays `shadow_display`, and `legacy` is the rollback setting.
 
-Run the bounded 25-second GPU smoke on Modal (one T4, 600-second timeout):
+`tracklet_aggregation` is the realtime polyline engine. It filters short, stationary and
+directionally inconsistent observations, links compatible tracklets by spatial distance, directed
+motion and time gap, then clusters and merges them into a smoothed curved polyline. Support is
+distinct tracker IDs in the recent window, not unique people after an ID switch.
+Candidates must persist for 5 seconds before activation by default; path geometry and score use a
+low-alpha EMA, and short evidence gaps keep the last active path visible instead of replacing it
+immediately. Compatible extensions are joined at directed endpoints, while a weak match never
+shortens the remembered camera-entry-to-exit route. With the Shibuya config, `route_memory_seconds: 120`
+keeps that complete polyline in cooling before it is retired.
+
+To upload an arbitrary local video to Modal GPU and render these Common Paths directly into the
+output MP4, use the batch runner. The duration option is optional:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+modal run --quiet --timestamps modal_common_path.py `
+  --input data/videos/my-video.mp4 `
+  --start-seconds 0 `
+  --duration-seconds 25 `
+  --engine tracklet_aggregation `
+  --config configs/shibuya.yaml `
+  --run-id my-video-tracklet-20260922 `
+  --cache-policy reuse
+```
+
+The rendered video is downloaded to
+`outputs/common_path/my-video-tracklet-20260922/tracked_points_common_path.mp4`; the same
+directory contains the tracking cache, timeline, metrics and manifest. The runner uploads the
+video to the `crowd-analysis-data` Modal Volume once per content hash and uses the T4 GPU for
+detector/tracker inference.
+
+Run the GPU Common Path job on Modal (one T4, up to 1-hour function timeout). Omit
+`--duration-seconds` to process the input video through its end; add it only when a bounded
+run is needed:
 
 ```powershell
 $env:PYTHONUTF8="1"
@@ -119,6 +152,16 @@ modal run --quiet modal_common_path.py `
   --engine shadow --mode offline_fast `
   --config configs/default.yaml `
   --run-id dg-smoke-YYYYMMDD-a --cache-policy reuse
+```
+
+For the full video, remove the duration option:
+
+```powershell
+modal run --quiet modal_common_path.py `
+  --input data/videos/data-test.mp4 `
+  --engine tracklet_aggregation --mode offline_fast `
+  --config configs/default.yaml `
+  --run-id tracklet-full-YYYYMMDD-a --cache-policy reuse
 ```
 
 The remote job saves a content-addressed detection/track cache and run artifacts in the
@@ -146,7 +189,7 @@ disables Grand Central polygons; add camera-specific polygons before interpretin
 
 ### Live Shibuya from Modal
 
-The live path runs YOLO, ByteTrack, dominant live-flow analytics and rendering in one ordered
+The live path runs YOLO, ByteTrack, tracklet aggregation and rendering in one ordered
 Modal T4 session. The browser receives binary JPEG packets directly over an authenticated
 WebSocket; the token below is an ephemeral session token, not a Modal account token.
 
@@ -171,7 +214,7 @@ $env:VITE_MODAL_LIVE_WS_URL = "wss://<modal-host>/ws/live"
 $env:VITE_MODAL_LIVE_TOKEN = "<the-session-token-from-terminal-1>"
 $env:VITE_MODAL_LIVE_DURATION_SECONDS = "200"
 $env:VITE_MODAL_LIVE_PREVIEW_FPS = "10"
-$env:VITE_MODAL_LIVE_RUN_ID = "live-dominant-YYYYMMDD-smoke"
+$env:VITE_MODAL_LIVE_RUN_ID = "live-tracklet-YYYYMMDD-smoke"
 npm run dev -- --port 5176
 ```
 
@@ -182,11 +225,27 @@ inference, so replay analytics changes from the downloaded `tracking_cache.jsonl
 starting another GPU session. Stop both terminals after testing; `modal serve` then tears down
 the ephemeral deployment.
 
+The **Số đường hiển thị** control changes the backend-rendered `max_paths` limit (1-5) over the
+existing WebSocket. It does not restart YOLO/ByteTrack or erase candidate evidence. Only paths
+with enough support are returned, so the UI can show fewer than the selected limit.
+
+Replay the compatible Shibuya cache without loading YOLO:
+
+```powershell
+python -m scripts.replay_tracklet `
+  --cache outputs/live-dominant-ui-fix-20260920-235206/tracking_cache.jsonl `
+  --input data/videos/data-shibuya-test.mp4 `
+  --output-dir outputs/common_path/tracklet-replay-local
+```
+
 The live endpoint accepts only `realtime_pts`: playback is paced by source timestamps and stale
 input frames are dropped when CUDA inference cannot keep up. The output is stored remotely under
 `/root/data/common_path/runs/<run-id>` and should be downloaded to
-`outputs/common_path/<run-id>`. Set `analytics.dominant_live_flow.mode` back to
-`validated_route` to roll the analytics engine back without changing the streaming transport.
+`outputs/common_path/<run-id>`. To roll back, set `analytics.common_path.engine` to
+`directional_grid` and `analytics.dominant_live_flow.mode` to `dominant_live_flow`, then start a
+new session. Engine changes reset analytics state; changing only `max_paths` does not. Geometry
+thresholds under `tracklet_aggregation` are normalized image fractions and are initial,
+uncalibrated Shibuya values.
 
 To render the time-varying dominant movement direction from the immutable Shibuya cache on a
 Modal T4, without rerunning YOLO:

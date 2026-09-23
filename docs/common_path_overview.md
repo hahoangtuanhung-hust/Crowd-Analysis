@@ -198,6 +198,9 @@ modal run --quiet modal_common_path.py `
   --run-id dg-smoke-YYYYMMDD-a --cache-policy reuse
 ```
 
+Bỏ `--duration-seconds 25` để xử lý từ `--start-seconds` đến hết video. Chỉ thêm tham số này
+khi cần giới hạn một đoạn ngắn để smoke test hoặc replay.
+
 Replay analytics từ cache, không gọi detector:
 
 ```powershell
