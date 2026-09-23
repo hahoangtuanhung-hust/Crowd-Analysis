@@ -14,6 +14,9 @@ interface VideoPanelProps {
   editable?: boolean;
   runtime: RuntimeInfo;
   modalMetadata?: ModalLiveMetadata;
+  maxPaths?: number;
+  appliedMaxPaths?: number;
+  onMaxPathsChange?: (value: number) => void;
 }
 
 /**
@@ -21,7 +24,7 @@ interface VideoPanelProps {
  * hoặc hiện frame tĩnh cuối cùng khi session completed/stopped/error,
  * hoặc placeholder khi chưa có stream.
  */
-export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCalibrate, onZones, editable = true, runtime, modalMetadata }: VideoPanelProps) {
+export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCalibrate, onZones, editable = true, runtime, modalMetadata, maxPaths, appliedMaxPaths, onMaxPathsChange }: VideoPanelProps) {
   const status: SessionStatus | undefined = session?.status;
   const isLive = status === "running" || status === "starting";
 
@@ -54,6 +57,15 @@ export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCali
           <h2>{session?.camera_id ?? "Camera 01"}</h2>
         </div>
         <div className="video-tools">
+          {maxPaths !== undefined && (
+            <label className="path-limit">Số đường hiển thị
+              <select aria-label="Số đường hiển thị" data-testid="path-limit" data-applied={appliedMaxPaths} value={maxPaths}
+                onChange={(event) => onMaxPathsChange?.(Number(event.target.value))}>
+                {[1, 2, 3, 4, 5].map((count) => <option value={count} key={count}>{count}</option>)}
+              </select>
+              {maxPaths !== appliedMaxPaths && <span aria-live="polite">Đang áp dụng</span>}
+            </label>
+          )}
           {isLive && (
             <span className={runtime.mode === "replay" ? "live-badge replay-badge" : "live-badge"} aria-label={runtime.mode === "replay" ? "Cache replay" : "Live streaming"}>
               {runtime.mode !== "replay" && <span className="live-pulse" />}
@@ -84,10 +96,10 @@ export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCali
             {runtime.mode === "modal-live" && modalMetadata && (
               <>
                 <div className="dominant-flow-status" data-testid="dominant-flow-status">
-                  <strong>Dòng di chuyển đông nhất</strong>
+                  <strong>Common Paths</strong>
                   <span>
-                    {modalMetadata.direction
-                      ? `${modalMetadata.direction} · ${modalMetadata.active_count} người`
+                    {modalMetadata.path_state === "active"
+                      ? `${modalMetadata.active_count} track quan sát`
                       : modalMetadata.path_state === "confirming"
                         ? `Đang xác nhận ${modalMetadata.challenger_direction ?? "dòng mới"} · ${modalMetadata.challenger_count} người`
                         : "Đang tích lũy, chưa đủ dữ liệu"}

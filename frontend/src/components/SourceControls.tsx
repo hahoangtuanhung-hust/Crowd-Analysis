@@ -31,7 +31,7 @@ export function SourceControls({ status, replayMode = false, modalLive }: Source
         <div className="modal-source-kind"><Radio size={17} aria-hidden="true" /> Modal GPU Live</div>
         <div className="modal-source-name">
           <strong>{modalLive.sourceName}</strong>
-          <span>realtime_pts · dominant live flow</span>
+          <span>realtime_pts · tracklet common paths</span>
         </div>
         <div className="source-actions">
           {running ? (

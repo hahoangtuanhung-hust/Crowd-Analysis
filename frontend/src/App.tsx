@@ -221,6 +221,9 @@ export default function App() {
             editable={!modalMode}
             runtime={runtime}
             modalMetadata={modalLive.metadata}
+            maxPaths={modalMode ? modalLive.maxPaths : undefined}
+            appliedMaxPaths={modalLive.appliedMaxPaths}
+            onMaxPathsChange={modalLive.changeMaxPaths}
           />
 
           <HeatmapPanel

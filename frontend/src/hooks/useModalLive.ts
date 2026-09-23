@@ -23,6 +23,7 @@ interface FrameHeader extends ModalLiveMetadata {
   dropped_input_frames: number;
   jpeg_bytes: number;
   common_path: RemotePath | null;
+  paths?: RemotePath[];
 }
 
 interface ModalEvent {
@@ -33,6 +34,7 @@ interface ModalEvent {
   stream_epoch?: string;
   message?: string;
   manifest?: { status?: string };
+  applied_max_paths?: number;
 }
 
 const endpointValue = (import.meta.env.VITE_MODAL_LIVE_WS_URL as string | undefined)?.trim() ?? "";
@@ -64,6 +66,8 @@ export function useModalLive() {
   const [error, setError] = useState<string | null>(modalConfiguration.error);
   const [identity, setIdentity] = useState({ sessionId: "", epoch: "" });
   const [data, setData] = useState<LiveSnapshot>(EMPTY_SNAPSHOT);
+  const [maxPaths, setMaxPaths] = useState(3);
+  const [appliedMaxPaths, setAppliedMaxPaths] = useState(3);
 
   useEffect(() => {
     if (!enabled) return;
@@ -86,6 +90,10 @@ export function useModalLive() {
           setConnected(true);
           setStatus((current) => current === "error" ? "idle" : current);
         }
+        if (event.event === "max_paths_applied" && event.applied_max_paths) {
+          setAppliedMaxPaths(event.applied_max_paths);
+        }
+        if (event.event === "control_error") setError(event.message ?? "Invalid path limit");
         if (event.event === "loading_model") {
           setIdentity({ sessionId: event.session_id ?? "", epoch: event.stream_epoch ?? "" });
           setStatus("starting");
@@ -118,6 +126,7 @@ export function useModalLive() {
       imageUrlRef.current = nextUrl;
       setFrameUrl(nextUrl);
       setMetadata(header);
+      if (header.applied_max_paths) setAppliedMaxPaths(header.applied_max_paths);
       setStatus("running");
       setData({
         ...EMPTY_SNAPSHOT,
@@ -148,7 +157,7 @@ export function useModalLive() {
           queue_size: header.queue_depth,
           dropped_frames: header.dropped_input_frames
         },
-        common_paths: header.common_path ? [header.common_path] : [],
+        common_paths: header.paths ?? (header.common_path ? [header.common_path] : []),
         frame_url: nextUrl
       });
       socket.send(JSON.stringify({ action: "frame_ack", frame_id: header.frame_id, event_seq: header.event_seq }));
@@ -181,17 +190,27 @@ export function useModalLive() {
       duration_seconds: defaultDuration,
       preview_fps: defaultPreviewFps,
       processing_mode: "realtime_pts",
-      client_kind: "browser-ui"
+      client_kind: "browser-ui",
+      max_paths: maxPaths
     }));
-  }, []);
+  }, [maxPaths]);
+
+  const changeMaxPaths = useCallback((value: number) => {
+    if (!Number.isInteger(value) || value < 1 || value > 5) return;
+    setMaxPaths(value);
+    if (socketRef.current?.readyState === WebSocket.OPEN && status === "running") {
+      socketRef.current.send(JSON.stringify({ action: "set_max_paths", max_paths: value }));
+    }
+  }, [status]);
 
   const stop = useCallback(() => socketRef.current?.send(JSON.stringify({ action: "stop" })), []);
   const mergedData = data.session ? { ...data, session: { ...data.session, status, error } } : data;
-  return { requested, enabled, connected, data: mergedData, frameUrl, metadata, status, error, identity, start, stop };
+  return { requested, enabled, connected, data: mergedData, frameUrl, metadata, status, error, identity, start, stop,
+    maxPaths, appliedMaxPaths, changeMaxPaths };
 }
 
 function createRunId(prefix: string): string {
-  const base = prefix || "live-dominant";
+  const base = prefix || "live-tracklet";
   const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
   const maxBaseLength = Math.max(1, 64 - suffix.length - 1);
   return `${base.slice(0, maxBaseLength)}-${suffix}`;

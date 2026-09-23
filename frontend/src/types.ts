@@ -53,6 +53,7 @@ export interface ModalLiveMetadata {
   moving_track_count: number;
   dropped_input_frames: number;
   dropped_preview_frames: number;
+  applied_max_paths?: number;
 }
 
 export interface CrowdSummary {
@@ -115,6 +116,10 @@ export interface CommonPath {
   direction: string;
   polyline: [number, number][];
   updated_at: number;
+  support_tracks?: number;
+  color?: string;
+  rank?: number;
+  evidence_until_s?: number;
 }
 
 export interface ZoneMetric {
