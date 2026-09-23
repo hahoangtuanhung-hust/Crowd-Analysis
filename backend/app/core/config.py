@@ -99,9 +99,41 @@ class ServerConfig(StrictModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
 
+class TrackletAggregationConfig(StrictModel):
+    evidence_window_seconds: float = Field(default=30.0, gt=0)
+    update_interval_seconds: float = Field(default=0.5, gt=0)
+    min_support_tracks: int = Field(default=3, ge=2)
+    confirmation_seconds: float = Field(default=5.0, ge=0)
+    switch_margin_tracks: int = Field(default=2, ge=0)
+    switch_hold_seconds: float = Field(default=5.0, ge=0)
+    cooling_seconds: float = Field(default=4.0, ge=0)
+    route_memory_seconds: float | None = Field(default=None, gt=0)
+    path_ema_alpha: float = Field(default=0.12, gt=0.0, le=1.0)
+    max_candidates: int = Field(default=20, ge=5, le=100)
+    max_matching_tracklets: int = Field(default=256, ge=32, le=1024)
+    max_tracks: int = Field(default=2048, ge=1)
+    max_points_per_track: int = Field(default=96, ge=4)
+    min_track_points: int = Field(default=4, ge=2)
+    min_track_duration_seconds: float = Field(default=0.35, ge=0)
+    min_displacement_fraction: float = Field(default=0.018, gt=0)
+    min_direction_consistency: float = Field(default=0.55, ge=0.0, le=1.0)
+    max_path_stretch: float = Field(default=2.75, gt=1.0)
+    min_step_fraction: float = Field(default=0.002, gt=0)
+    max_step_fraction: float = Field(default=0.12, gt=0)
+    max_observation_gap_seconds: float = Field(default=0.8, gt=0)
+    max_link_gap_seconds: float = Field(default=1.6, gt=0)
+    sample_spacing_fraction: float = Field(default=0.012, gt=0)
+    match_distance_fraction: float = Field(default=0.025, gt=0)
+    match_angle_degrees: float = Field(default=40, gt=0, le=90)
+    min_overlap_fraction: float = Field(default=0.30, gt=0, le=1)
+    min_supported_samples: int = Field(default=3, ge=2)
+
+
 class CommonPathConfig(StrictModel):
     enabled: bool = True
-    engine: Literal["legacy", "directional_grid", "shadow"] = "legacy"
+    engine: Literal["legacy", "directional_grid", "shadow", "tracklet_aggregation"] = "legacy"
+    max_paths: int = Field(default=3, ge=1, le=5)
+    tracklet_aggregation: TrackletAggregationConfig = Field(default_factory=TrackletAggregationConfig)
     shadow_display: Literal["legacy", "directional_grid"] = "legacy"
     max_active_paths: int = Field(default=1, ge=1, le=5)
     grid_columns: int = Field(default=8, ge=2, le=128)

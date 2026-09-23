@@ -85,7 +85,24 @@ analytics:
   ddcrp_tracklet_seconds: 1.5
   common_path:
     enabled: true
-    engine: directional_grid
+    engine: tracklet_aggregation
+    max_paths: 3
+    tracklet_aggregation:
+      evidence_window_seconds: 30.0
+      update_interval_seconds: 0.5
+      min_support_tracks: 3
+      confirmation_seconds: 5.0
+      switch_margin_tracks: 2
+      switch_hold_seconds: 5.0
+      cooling_seconds: 4.0
+      route_memory_seconds: 120.0
+      path_ema_alpha: 0.12
+      max_candidates: 20
+      max_matching_tracklets: 256
+      min_track_duration_seconds: 0.35
+      min_direction_consistency: 0.55
+      max_path_stretch: 2.75
+      max_link_gap_seconds: 1.6
     grid_columns: 8
     grid_rows: 5
     cell_hysteresis_ratio: 0.12
@@ -158,7 +175,7 @@ analytics:
     max_diagnostic_evaluations: 5000
     max_diagnostic_evidence_samples: 20
   dominant_live_flow:
-    mode: dominant_live_flow
+    mode: validated_route
     columns: 32
     rows: 18
     direction_bins: 8

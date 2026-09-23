@@ -176,7 +176,7 @@ class FrameRenderer:
         for path in snapshot.paths:
             if path.state not in {"active", "cooling"}:
                 continue
-            key = (path.origin_zone, path.destination_zone)
+            key = (path.path_id, "tracklet") if path.color else (path.origin_zone, path.destination_zone)
             previous = selected.get(key)
             if previous is None or (previous.state == "cooling" and path.state == "active"):
                 selected[key] = path
@@ -199,6 +199,8 @@ class FrameRenderer:
         path: CommonPath,
         timestamp: float,
     ) -> CommonPath:
+        if path.color:
+            return path
         signature = (path.path_id, path.polyline)
         target = self._resample_polyline(path.polyline)
         state = self._display_paths.get(key)
@@ -265,9 +267,13 @@ class FrameRenderer:
                 + path.score * (style.max_width_pixels - style.min_width_pixels)
             )
             center_width = max(style.min_width_pixels, min(style.max_width_pixels, center_width))
+            if path.color:
+                center_width = 4
             cooling = path.state == "cooling"
-            center_color = (145, 153, 162) if cooling else style.centerline_color_bgr
-            corridor_color = (92, 98, 104) if cooling else style.corridor_color_bgr
+            center_color = (145, 153, 162) if cooling else (
+                tuple(bytes.fromhex(path.color[1:])[::-1]) if path.color else style.centerline_color_bgr
+            )
+            corridor_color = (32, 32, 32) if path.color else ((92, 98, 104) if cooling else style.corridor_color_bgr)
 
             corridor = frame.copy()
             cv2.polylines(
@@ -275,10 +281,10 @@ class FrameRenderer:
                 [points],
                 False,
                 corridor_color,
-                center_width + 14,
+                center_width + (4 if path.color else 14),
                 cv2.LINE_AA,
             )
-            corridor_alpha = style.corridor_opacity * (0.55 if cooling else 1.0)
+            corridor_alpha = (0.75 if path.color else style.corridor_opacity) * (0.55 if cooling else 1.0)
             cv2.addWeighted(corridor, corridor_alpha, frame, 1.0 - corridor_alpha, 0.0, frame)
 
             centerline = frame.copy()
@@ -291,6 +297,8 @@ class FrameRenderer:
                 cv2.LINE_AA,
             )
             if show_arrows:
+                # Tracklet paths are curved polylines, so direction must be
+                # visible along the route rather than only at the last vertex.
                 self._draw_spaced_arrows(
                     centerline,
                     np.asarray(path.polyline, dtype=np.float64),
@@ -298,7 +306,7 @@ class FrameRenderer:
                     max(2, center_width // 2),
                     style.arrow_spacing_pixels,
                 )
-            line_alpha = style.centerline_opacity * (0.65 if cooling else 1.0)
+            line_alpha = (1.0 if path.color else style.centerline_opacity) * (0.65 if cooling else 1.0)
             cv2.addWeighted(centerline, line_alpha, frame, 1.0 - line_alpha, 0.0, frame)
             self._draw_path_label(frame, path, center_color)
 
@@ -385,7 +393,9 @@ class FrameRenderer:
         frame: NDArray[np.uint8], path: CommonPath, color: tuple[int, int, int]
     ) -> None:
         anchor_x, anchor_y = map(round, path.polyline[0])
-        if path.origin_zone in {"dominant_direction", "dominant_live_flow"}:
+        if path.color:
+            label = f"{path.path_id} | {path.support_tracks} IDs"
+        elif path.origin_zone in {"dominant_direction", "dominant_live_flow"}:
             direction = path.destination_zone.replace("_", " ").title()
             label = f"Dominant {direction} | {path.unique_tracks_short} moving"
         else:
