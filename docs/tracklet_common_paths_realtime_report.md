@@ -16,7 +16,7 @@
   shortens the remembered camera-entry-to-exit polyline. Score/confidence use a low-alpha EMA,
   short evidence gaps keep an active path unchanged, and `route_memory_seconds: 120` keeps the
   complete geometry in cooling before retirement.
-- `configs/default.yaml` and `configs/shibuya.yaml` select `tracklet_aggregation` with `max_paths: 3`; old `directional_grid` and `dominant_live_flow` remain rollback options.
+- `configs/default.yaml` and `configs/shibuya.yaml` select `tracklet_aggregation` with `max_paths: 1`; old `directional_grid` and `dominant_live_flow` remain rollback options.
 - Backend snapshot/renderer now carries `color`, `rank`, `support_tracks`, `evidence_until_s` and renders thin solid colored polylines with direction arrows.
 - Modal WebSocket accepts `max_paths` at start and `set_max_paths` while running. The frontend control sends and displays the applied value, and the legend uses the backend snapshot.
 
