@@ -19,6 +19,7 @@ Vì một số file có kích thước lớn hoặc chứa thông tin nhạy c�
 3. **Các Video mẫu (Sample Videos):**
    - Tất cả các file `*.mp4`, `*.zip`, `*.rar` đều bị chặn đưa lên Git.
    - Các lệnh ví dụ trong tài liệu có sử dụng `data/videos/example-people.mp4`, `data/videos/data-test.mp4`, `data/videos/data-shibuya-test.mp4`. Bạn cần tự đưa video của riêng bạn vào thư mục `data/videos/` hoặc thay đổi đường dẫn video trong câu lệnh cho phù hợp.
+   - Link data: https://drive.google.com/drive/folders/1xk1zULbKf0RPjKTiDgV9D-grpo2GfMmd?usp=sharing
 4. **Tập dữ liệu Grand Central (Tùy chọn):**
    - Nếu bạn muốn đánh giá trên bộ dữ liệu Grand Central, bạn cần phải tải thủ công hoặc chạy script.
    - Bạn cần sử dụng lệnh tải: `python scripts/setup_grand_central.py --download` (Xem chi tiết ở phần dưới).
