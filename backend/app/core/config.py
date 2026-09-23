@@ -131,8 +131,8 @@ class TrackletAggregationConfig(StrictModel):
 
 class CommonPathConfig(StrictModel):
     enabled: bool = True
-    engine: Literal["legacy", "directional_grid", "shadow", "tracklet_aggregation"] = "legacy"
-    max_paths: int = Field(default=3, ge=1, le=5)
+    engine: Literal["legacy", "directional_grid", "shadow", "tracklet_aggregation"] = "tracklet_aggregation"
+    max_paths: int = Field(default=1, ge=1, le=5)
     tracklet_aggregation: TrackletAggregationConfig = Field(default_factory=TrackletAggregationConfig)
     shadow_display: Literal["legacy", "directional_grid"] = "legacy"
     max_active_paths: int = Field(default=1, ge=1, le=5)
@@ -331,6 +331,9 @@ class CommonPathTestConfig(StrictModel):
 
 
 class AnalyticsConfig(StrictModel):
+    # Legacy occupancy/flow/zone analyzers remain available for compatibility
+    # and dataset tooling, but are disabled in the production Common Path profile.
+    auxiliary_analytics_enabled: bool = True
     grid_width: int = Field(default=64, ge=4)
     grid_height: int = Field(default=36, ge=4)
     trajectory_history_points: int = Field(default=150, ge=2)

@@ -81,7 +81,7 @@ def _sha256(path: Path) -> str:
 
 @app.local_entrypoint()
 def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
-         duration_seconds: float | None = None, engine: str = "directional_grid",
+         duration_seconds: float | None = None, engine: str = "tracklet_aggregation",
          mode: str = "offline_fast", config: str = "configs/default.yaml",
          run_id: str = "", cache_policy: str = "reuse") -> None:
     if mode != "offline_fast":

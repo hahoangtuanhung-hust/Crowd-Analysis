@@ -137,6 +137,7 @@ def create_app(
             "inference_executed": None,
             "detector_calls": None,
             "cache_reads": None,
+            "common_path_only": False,
         }
 
     @app.get("/metrics")

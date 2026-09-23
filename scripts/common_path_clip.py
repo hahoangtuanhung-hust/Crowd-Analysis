@@ -20,10 +20,10 @@ import yaml
 
 from backend.app.analytics.common_path import CommonPathAnalyzer
 from backend.app.analytics.directional_grid import DirectionalGridEngine, GridTrackPoint
-from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
+from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine, TrackletPoint
 from backend.app.analytics.spatial import SpatialTransformer
 from backend.app.core.config import load_config
-from backend.app.schemas import Detection, TrackedObject
+from backend.app.schemas import CommonPathSnapshot, Detection, TrackedObject
 from backend.app.video.renderer import FrameRenderer, OverlayOptions
 
 
@@ -67,17 +67,23 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     if fps <= 0 or width <= 0 or height <= 0:
         raise ValueError("Source FPS/resolution unavailable")
     transformer = SpatialTransformer.pixel(width, height)
-    grid = DirectionalGridEngine(config.analytics.directional_grid, transformer,
-                                 stream_epoch=run_id, zones=config.analytics.zones)
-    tracklet = TrackletAggregationEngine(
-        config.analytics.common_path.tracklet_aggregation,
-        transformer,
-        camera_id="cam01",
-        stream_epoch=run_id,
-        max_paths=config.analytics.common_path.max_paths,
-    )
-    legacy = CommonPathAnalyzer(config.analytics, transformer)
     selected = config.analytics.common_path.shadow_display if engine == "shadow" else engine
+    grid = (
+        DirectionalGridEngine(config.analytics.directional_grid, transformer,
+                              stream_epoch=run_id, zones=config.analytics.zones)
+        if engine in ("directional_grid", "shadow") else None
+    )
+    tracklet = (
+        TrackletAggregationEngine(
+            config.analytics.common_path.tracklet_aggregation,
+            transformer,
+            camera_id="cam01",
+            stream_epoch=run_id,
+            max_paths=config.analytics.common_path.max_paths,
+        )
+        if engine == "tracklet_aggregation" else None
+    )
+    legacy = CommonPathAnalyzer(config.analytics, transformer) if engine in ("legacy", "shadow") else None
     renderer = FrameRenderer(config.visualization)
     overlay = OverlayOptions.from_visualization(config.visualization)
     input_hash = input_hash or digest(input_path)
@@ -120,8 +126,8 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     ram_samples_mb: list[float] = []
     frame_ids: list[int] = []
     count_tracks: set[int] = set()
-    latest_snapshot = grid.snapshot()
-    legacy_snapshot = legacy.snapshot()
+    latest_snapshot = CommonPathSnapshot(0.0, ())
+    legacy_snapshot = CommonPathSnapshot(0.0, ())
     first_frame: np.ndarray | None = None
     last_frame: np.ndarray | None = None
     last_time = start_seconds
@@ -135,6 +141,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     rebuilt_cache_path = output_dir / "tracking_cache_rebuilt.jsonl" if rebuild_tracks else None
     rebuilt_cache_writer = (rebuilt_cache_path.open("w", encoding="utf-8")
                             if rebuilt_cache_path else None)
+    point_type = TrackletPoint if selected == "tracklet_aggregation" else GridTrackPoint
     began = time.perf_counter()
     try:
         for frame_id in range(start_frame, end_frame):
@@ -183,17 +190,20 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                     detections=[asdict(d) for d in detections],
                     tracks=[asdict(t) for t in tracks])) + "\n")
             count_tracks.update(t.track_id for t in tracks)
-            points = [GridTrackPoint("cam01", run_id, t.track_id, 0, frame_id,
-                                     timestamp, *t.bottom_center, observed=t.observed)
+            points = [point_type("cam01", run_id, t.track_id, 0, frame_id,
+                                 timestamp, *t.bottom_center, observed=t.observed)
                       for t in tracks]
             t2 = time.perf_counter()
             if engine in ("directional_grid", "shadow"):
+                assert grid is not None
                 latest_snapshot = grid.update(points, timestamp)
             elif engine == "tracklet_aggregation":
+                assert tracklet is not None
                 latest_snapshot = tracklet.update(points, timestamp)
             directional_ms = (time.perf_counter() - t2) * 1000
             legacy_ms = 0.
             if engine in ("legacy", "shadow"):
+                assert legacy is not None
                 legacy_started = time.perf_counter()
                 legacy_snapshot = legacy.process_points(
                     [SimpleNamespace(camera_id="cam01", track_id=t.track_id,
@@ -241,6 +251,8 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             rebuilt_cache_writer.close()
     if not frame_ids:
         raise RuntimeError("Clip has no decoded frames")
+    if tracklet is not None:
+        latest_snapshot = tracklet.finalize(last_time)
     if cache_writer is not None:
         cache_path.with_suffix(".meta.json").write_text(
             json.dumps(dict(cache_key=key, source_hash=input_hash, model_hash=model_hash,
@@ -266,30 +278,31 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         last_frame, (), latest_snapshot if selected in ("directional_grid", "tracklet_aggregation") else legacy_snapshot,
         tuple(config.analytics.zones), transformer, overlay,
         people_count=0, processing_fps=0, latency_ms=0, timestamp=last_time))
-    for image_name in ("directional_field_debug.png", "edge_flow_debug.png"):
-        debug = first_frame.copy()
-        if image_name.startswith("directional"):
-            for cell, bins in grid.histogram().items():
-                x = int((cell[1]+.5)*width/config.analytics.directional_grid.columns)
-                y = int((cell[0]+.5)*height/config.analytics.directional_grid.rows)
-                strong = sorted(((direction, support[1]) for direction, support in bins.items()
-                                 if support[1] >= config.analytics.directional_grid.min_edge_unique_tracks),
-                                key=lambda item: -item[1])[:2]
-                for direction, total in strong:
-                    angle = direction*2*math.pi/config.analytics.directional_grid.direction_bins
-                    cv2.arrowedLine(debug, (x,y), (x+int(17*math.cos(angle)),y+int(17*math.sin(angle))),
-                                    (0,255,255), max(1,min(3,total)), tipLength=.35)
-        else:
-            for edge in grid.flow_snapshot().edges:
-                if edge.unique_tracks_long < config.analytics.directional_grid.min_edge_unique_tracks:
-                    continue
-                a,b = edge.from_cell,edge.to_cell
-                scale = lambda cell: (int((cell[1]+.5)*width/config.analytics.directional_grid.columns),
-                                      int((cell[0]+.5)*height/config.analytics.directional_grid.rows))
-                cv2.arrowedLine(debug,scale(a),scale(b),(40,220,40),
-                                max(1,min(4,edge.unique_tracks_long)),tipLength=.4)
-        cv2.imwrite(str(output_dir / image_name), debug)
-    path_events = list(tracklet.events) if engine == "tracklet_aggregation" else list(grid.events)
+    if grid is not None:
+        for image_name in ("directional_field_debug.png", "edge_flow_debug.png"):
+            debug = first_frame.copy()
+            if image_name.startswith("directional"):
+                for cell, bins in grid.histogram().items():
+                    x = int((cell[1]+.5)*width/config.analytics.directional_grid.columns)
+                    y = int((cell[0]+.5)*height/config.analytics.directional_grid.rows)
+                    strong = sorted(((direction, support[1]) for direction, support in bins.items()
+                                     if support[1] >= config.analytics.directional_grid.min_edge_unique_tracks),
+                                    key=lambda item: -item[1])[:2]
+                    for direction, total in strong:
+                        angle = direction*2*math.pi/config.analytics.directional_grid.direction_bins
+                        cv2.arrowedLine(debug, (x,y), (x+int(17*math.cos(angle)),y+int(17*math.sin(angle))),
+                                        (0,255,255), max(1,min(3,total)), tipLength=.35)
+            else:
+                for edge in grid.flow_snapshot().edges:
+                    if edge.unique_tracks_long < config.analytics.directional_grid.min_edge_unique_tracks:
+                        continue
+                    a,b = edge.from_cell,edge.to_cell
+                    scale = lambda cell: (int((cell[1]+.5)*width/config.analytics.directional_grid.columns),
+                                          int((cell[0]+.5)*height/config.analytics.directional_grid.rows))
+                    cv2.arrowedLine(debug,scale(a),scale(b),(40,220,40),
+                                    max(1,min(4,edge.unique_tracks_long)),tipLength=.4)
+            cv2.imwrite(str(output_dir / image_name), debug)
+    path_events = list(tracklet.events) if tracklet is not None else list(grid.events) if grid is not None else []
     if not path_events:
         path_events.append(dict(
             event="insufficient_data",
@@ -308,6 +321,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         return round(float(np.percentile([t[field] for t in timings], 95)), 3)
     switch_count = sum(event["event"] == "switch" for event in path_events)
     media_duration = max(last_time - start_seconds, 1e-9)
+    final_snapshot = legacy_snapshot if selected == "legacy" else latest_snapshot
     summary = dict(run_type="analytics_replay" if replay_cache else "gpu_pipeline",
                    engine=engine, selected_display=selected, frames=len(frame_ids),
                    first_frame=frame_ids[0], last_frame=frame_ids[-1],
@@ -316,12 +330,12 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    tracks_source=("rebuilt_from_cached_detections" if rebuild_tracks else
                                   "cached_tracks" if replay_cache else "live_gpu_pipeline"),
                    unique_track_ids=len(count_tracks),
-                   result="active" if latest_snapshot.paths else "insufficient_data",
-                   active_paths=[asdict(p) for p in latest_snapshot.paths],
-                   legacy_paths=[asdict(p) for p in legacy_snapshot.paths] if engine != "directional_grid" else [],
-                   directional_edges=len(grid.flow_snapshot().edges) if engine != "tracklet_aggregation" else 0,
-                   support_cap_drops=grid.overflow,
-                   rejected_jump_segments=grid.rejected_jumps,
+                   result="active" if final_snapshot.paths else "insufficient_data",
+                   active_paths=[asdict(p) for p in final_snapshot.paths],
+                   legacy_paths=[asdict(p) for p in legacy_snapshot.paths] if legacy is not None else [],
+                   directional_edges=len(grid.flow_snapshot().edges) if grid is not None else 0,
+                   support_cap_drops=grid.overflow if grid is not None else 0,
+                   rejected_jump_segments=grid.rejected_jumps if grid is not None else 0,
                    analytics_p50_ms=p50("analytics_ms"), analytics_p95_ms=p95("analytics_ms"),
                    decode_p50_ms=p50("decode_ms"), decode_p95_ms=p95("decode_ms"),
                    inference_p50_ms=p50("inference_ms"), inference_p95_ms=p95("inference_ms"),
@@ -333,7 +347,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    path_switches=switch_count,
                    switches_per_minute=round(switch_count / (media_duration / 60), 3),
                    validated_route_support=[path.validated_complete_tracks
-                                            for path in latest_snapshot.paths],
+                                            for path in final_snapshot.paths],
                    polyline_jitter_px=None,
                    change_detection_delay_s=None,
                    processing_fps=round(len(frame_ids)/elapsed, 3),
@@ -373,7 +387,7 @@ def main() -> None:
     parser.add_argument("--start-seconds", type=float, default=0.)
     parser.add_argument("--duration-seconds", type=float,
                         help="Optional processing limit; omit to process through end of input")
-    parser.add_argument("--engine", choices=("legacy", "directional_grid", "tracklet_aggregation", "shadow"), default="directional_grid")
+    parser.add_argument("--engine", choices=("legacy", "directional_grid", "tracklet_aggregation", "shadow"), default="tracklet_aggregation")
     parser.add_argument("--replay-cache", type=Path)
     parser.add_argument("--source-hash")
     parser.add_argument("--model-hash")

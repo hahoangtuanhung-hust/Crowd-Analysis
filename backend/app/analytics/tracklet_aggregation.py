@@ -2,9 +2,9 @@
 
 The engine keeps short observed tracklets, rejects weak or inconsistent motion,
 links compatible tracklets with a directed graph, and merges each component into
-one smoothed representative polyline.  A grid is deliberately not used for the
-Common Path decision; ``GridTrackPoint`` is only the existing point transport
-schema shared by the analytics pipeline.
+one smoothed representative polyline. A grid is deliberately not used for the
+Common Path decision; the engine consumes only camera/session, track, frame,
+timestamp, and coordinate fields.
 """
 
 from __future__ import annotations
@@ -13,19 +13,32 @@ import math
 import statistics
 import time
 from collections import Counter, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from itertools import chain
-from typing import Iterable
 
 import numpy as np
 
-from backend.app.analytics.directional_grid import GridTrackPoint
 from backend.app.analytics.spatial import SpatialTransformer
 from backend.app.core.config import TrackletAggregationConfig
 from backend.app.schemas import CommonPath, CommonPathSnapshot
 
 TrackKey = tuple[str, str, int]
 COLORS = ("#ffca42", "#37d5c4", "#ff718d", "#80aaff", "#d3a1f5", "#9ce56a", "#ff9e68")
+
+
+@dataclass(frozen=True, slots=True)
+class TrackletPoint:
+    camera_id: str
+    stream_epoch: str
+    track_id: int
+    segment_id: int
+    frame_id: int
+    event_time_s: float
+    x: float
+    y: float
+    confirmed: bool = True
+    observed: bool = True
 
 
 @dataclass
@@ -91,6 +104,8 @@ class TrackletAggregationEngine:
         self._last_time = -math.inf
         self.events.clear()
         self.rejections.clear()
+        self.compute_ms.clear()
+        self.candidate_count = 0
 
     def set_max_paths(self, value: int) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
@@ -102,7 +117,24 @@ class TrackletAggregationEngine:
     def snapshot(self) -> CommonPathSnapshot:
         return self._snapshot
 
-    def update(self, points: Iterable[GridTrackPoint], timestamp: float) -> CommonPathSnapshot:
+    def finalize(self, timestamp: float | None = None) -> CommonPathSnapshot:
+        """Evaluate the final active segments without waiting for the interval."""
+        if self._last_time == -math.inf and timestamp is None:
+            return self._snapshot
+        event_time = self._last_time if timestamp is None else timestamp
+        if event_time < self._last_time:
+            raise ValueError("finalization timestamp moved backwards")
+        self._last_time = event_time
+        self._compute(event_time)
+        self._last_compute = event_time
+        return self._snapshot
+
+    @property
+    def buffered_segment_count(self) -> int:
+        """Number of active and closed segments retained by the bounded buffer."""
+        return len(self._segments) + len(self._closed)
+
+    def update(self, points: Iterable[TrackletPoint], timestamp: float) -> CommonPathSnapshot:
         points = tuple(points)
         if timestamp < self._last_time or any(
             p.camera_id != self.camera_id or p.stream_epoch != self.stream_epoch for p in points

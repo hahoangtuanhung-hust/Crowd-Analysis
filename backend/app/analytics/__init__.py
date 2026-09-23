@@ -12,6 +12,7 @@ from .point_tracklets import (
     TrajectoryPoint,
 )
 from .spatial import SpatialTransformer
+from .tracklet_aggregation import TrackletAggregationEngine, TrackletPoint
 from .trajectory import TrajectoryManager
 from .zones import ZoneAnalyzer
 
@@ -31,6 +32,8 @@ __all__ = [
     "PointTrackletManager",
     "PointTrackletUpdate",
     "SpatialTransformer",
+    "TrackletAggregationEngine",
+    "TrackletPoint",
     "TrajectoryManager",
     "TrajectoryPoint",
     "ZoneAnalyzer",

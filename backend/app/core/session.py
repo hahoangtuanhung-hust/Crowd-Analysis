@@ -428,6 +428,19 @@ class SessionManager:
         with self._lock:
             return self._visualization.model_copy(deep=True)
 
+    def runtime_info(self) -> dict[str, object]:
+        """Expose the active analysis contract so the UI avoids dead panels."""
+        return {
+            "mode": "live",
+            "source_mode": "configured_input",
+            "inference_executed": None,
+            "detector_calls": None,
+            "cache_reads": None,
+            "common_path_only": not self.config.analytics.auxiliary_analytics_enabled,
+            "common_path_engine": self.config.analytics.common_path.engine,
+            "default_max_paths": self.config.analytics.common_path.max_paths,
+        }
+
     def update_visualization(self, changes: dict[str, bool]) -> VisualizationConfig:
         with self._lock:
             self._visualization = self._visualization.model_copy(update=changes)

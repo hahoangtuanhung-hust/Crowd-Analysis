@@ -10,10 +10,11 @@ import platform
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import cv2
 import numpy as np
@@ -22,8 +23,8 @@ import yaml
 
 from backend.app.analytics.directional_grid import DirectionalGridEngine, GridTrackPoint
 from backend.app.analytics.dominant_live_flow import DominantLiveFlowEngine
-from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
 from backend.app.analytics.spatial import SpatialTransformer
+from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine, TrackletPoint
 from backend.app.core.config import load_config
 from backend.app.schemas import Detection, TrackedObject
 from backend.app.tracking import ByteTrackTracker
@@ -180,6 +181,7 @@ class LiveCommonPathProcessor:
                 variant="live_inference",
             )
             route_scope = config.analytics.directional_grid.route_scope
+        point_type = TrackletPoint if tracklet_mode else GridTrackPoint
         with self._engine_lock:
             self._engine = engine
         tracker = ByteTrackTracker(config.tracker)
@@ -320,7 +322,7 @@ class LiveCommonPathProcessor:
                     raw_last[track.track_id] = (media_s, x, y, source_frame_id)
 
                 points = [
-                    GridTrackPoint(
+                    point_type(
                         "shibuya-01", self.stream_epoch, track.track_id, 0,
                         source_frame_id, media_s, *track.bottom_center,
                         observed=track.observed,
@@ -533,6 +535,9 @@ class LiveCommonPathProcessor:
             raise
         finally:
             cap.release()
+            if isinstance(engine, TrackletAggregationEngine) and last_media_s >= 0:
+                with self._engine_lock:
+                    engine.finalize(last_media_s)
             if pending_rendered is not None:
                 repeats = 1
                 if not stopped and error is None:

@@ -6,22 +6,20 @@ import argparse
 import hashlib
 import json
 import statistics
-import time
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 
-from backend.app.analytics.directional_grid import GridTrackPoint
 from backend.app.analytics.spatial import SpatialTransformer
-from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
+from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine, TrackletPoint
 from backend.app.core.config import load_config
 from backend.app.schemas import TrackedObject
 from backend.app.video.renderer import FrameRenderer, OverlayOptions
 
 
-def run(cache: Path, source: Path, output: Path, config_path: Path, max_paths: int = 3) -> dict:
+def run(cache: Path, source: Path, output: Path, config_path: Path, max_paths: int = 1) -> dict:
     if output.exists():
         raise FileExistsError(output)
     meta = json.loads(cache.with_suffix(".meta.json").read_text(encoding="utf-8"))
@@ -68,7 +66,7 @@ def run(cache: Path, source: Path, output: Path, config_path: Path, max_paths: i
                     raise ValueError("Cache needs ordered frame/time and observed tracks")
                 last_frame, last_time = frame_id, timestamp
                 tracks = [TrackedObject(**track) for track in row["tracks"]]
-                points = [GridTrackPoint("cam01", "cache-replay", track.track_id, 0, frame_id,
+                points = [TrackletPoint("cam01", "cache-replay", track.track_id, 0, frame_id,
                                          timestamp, *track.bottom_center, observed=track.observed) for track in tracks]
                 snapshot = engine.update(points, timestamp)
                 active_frames += bool(snapshot.paths)
@@ -92,6 +90,7 @@ def run(cache: Path, source: Path, output: Path, config_path: Path, max_paths: i
                 if snapshot.paths:
                     cv2.imwrite(str(output / "ui_common_path.jpg"), rendered)
                 last_preview = timestamp
+        engine.finalize(last_time)
     finally:
         cap.release()
         writer.release()

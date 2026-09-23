@@ -52,6 +52,7 @@ video:
   reconnect_max_seconds: 30.0
 
 analytics:
+  auxiliary_analytics_enabled: false
   grid_width: 64
   grid_height: 36
   trajectory_history_points: 150
@@ -83,7 +84,7 @@ analytics:
   common_path:
     enabled: true
     engine: tracklet_aggregation
-    max_paths: 3
+    max_paths: 1
     tracklet_aggregation:
       evidence_window_seconds: 30.0
       update_interval_seconds: 0.5
