@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
@@ -28,10 +29,17 @@ image = (
 
 
 @app.function(image=image, gpu="T4", volumes={"/root/data": volume},
-              max_containers=1, timeout=3600, retries=0)
+# A 10-minute Shibuya video is substantially slower than wall-clock in the
+# current detector/render pipeline. Keep one invocation alive long enough for
+# the batch to finish; the function still writes its manifest to the Volume.
+              max_containers=1, timeout=14400, retries=0)
 def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds: float,
              duration_seconds: float | None, engine: str, run_id: str) -> dict:
+    import datetime as dt
     import sys
+    import threading
+    import subprocess
+    import psutil
     sys.path.insert(0, "/root")
     import torch
     if not torch.cuda.is_available():
@@ -46,17 +54,93 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
     config = Path(f"/tmp/{run_id}.yaml")
     config.write_text(config_text, encoding="utf-8")
     started = time.monotonic()
+    wall_started = dt.datetime.now(dt.timezone.utc)
+    process = psutil.Process()
+    samples: list[dict[str, object]] = []
+    stop_sampling = threading.Event()
+
+    def sample_resources() -> None:
+        process.cpu_percent(None)
+        while not stop_sampling.wait(1.0):
+            gpu_util = gpu_memory_used = gpu_memory_total = None
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=2, check=False,
+                )
+                fields = [item.strip() for item in result.stdout.splitlines()[0].split(",")]
+                if len(fields) >= 3:
+                    gpu_util, gpu_memory_used, gpu_memory_total = (float(fields[0]), float(fields[1]), float(fields[2]))
+            except (OSError, IndexError, ValueError, subprocess.TimeoutExpired):
+                pass
+            samples.append({
+                "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "cpu_percent": round(process.cpu_percent(None), 3),
+                "ram_mb": round(process.memory_info().rss / 1024**2, 3),
+                "gpu_utilization_percent": gpu_util,
+                "gpu_memory_used_mb": gpu_memory_used,
+                "gpu_memory_total_mb": gpu_memory_total,
+            })
+
+    sampler = threading.Thread(target=sample_resources, name="resource-sampler", daemon=True)
+    sampler.start()
     try:
         manifest = run(source, output, config_path=config, model_path=model,
                        start_seconds=start_seconds, duration_seconds=duration_seconds,
                        engine=engine, run_id=run_id, input_hash=source_hash,
                        model_hash=model_hash)
-        manifest["remote_wall_seconds"] = round(time.monotonic() - started, 2)
+        stop_sampling.set()
+        sampler.join(timeout=3)
+        elapsed = time.monotonic() - started
+        completed_at = dt.datetime.now(dt.timezone.utc)
+        (output / "resource_metrics.jsonl").write_text(
+            "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in samples),
+            encoding="utf-8",
+        )
+        cpu_values = [float(item["cpu_percent"]) for item in samples]
+        ram_values = [float(item["ram_mb"]) for item in samples]
+        gpu_values = [float(item["gpu_utilization_percent"]) for item in samples
+                      if item["gpu_utilization_percent"] is not None]
+        gpu_memory_values = [float(item["gpu_memory_used_mb"]) for item in samples
+                             if item["gpu_memory_used_mb"] is not None]
+        resources = {
+            "started_at_utc": wall_started.isoformat(),
+            "completed_at_utc": completed_at.isoformat(),
+            "remote_wall_seconds": round(elapsed, 3),
+            "sample_interval_seconds": 1,
+            "sample_count": len(samples),
+            "cpu_percent_avg": round(sum(cpu_values) / len(cpu_values), 3) if cpu_values else None,
+            "cpu_percent_peak": round(max(cpu_values), 3) if cpu_values else None,
+            "ram_peak_mb": round(max(ram_values), 3) if ram_values else None,
+            "gpu_utilization_avg_percent": round(sum(gpu_values) / len(gpu_values), 3) if gpu_values else None,
+            "gpu_utilization_peak_percent": round(max(gpu_values), 3) if gpu_values else None,
+            "gpu_memory_used_peak_mb": round(max(gpu_memory_values), 3) if gpu_memory_values else None,
+            "gpu": torch.cuda.get_device_name(0),
+        }
+        (output / "resource_summary.json").write_text(json.dumps(resources, indent=2), encoding="utf-8")
+        summary_path = output / "summary.json"
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary["timing"] = {
+                "started_at_utc": resources["started_at_utc"],
+                "completed_at_utc": resources["completed_at_utc"],
+                "remote_wall_seconds": resources["remote_wall_seconds"],
+            }
+            summary["resources"] = resources
+            summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        manifest["remote_wall_seconds"] = round(elapsed, 2)
+        manifest["completed_at_utc"] = resources["completed_at_utc"]
+        manifest["resource_summary"] = resources
         manifest["gpu"] = torch.cuda.get_device_name(0)
+        manifest["artifacts"] = sorted(path.name for path in output.iterdir() if path.is_file())
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         volume.commit()
         return manifest
     except Exception as exc:
+        stop_sampling.set()
+        sampler.join(timeout=3)
         output.mkdir(parents=True, exist_ok=True)
         (output / "manifest.json").write_text(json.dumps(dict(
             run_id=run_id, status="failed", error=str(exc),
@@ -66,8 +150,12 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
 
 
 def _cli(*args: str) -> str:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     result = subprocess.run(["modal", "volume", *args], capture_output=True,
-                            text=True, check=True)
+                            text=True, encoding="utf-8", errors="replace",
+                            env=env, check=True)
     return result.stdout
 
 
@@ -83,7 +171,8 @@ def _sha256(path: Path) -> str:
 def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
          duration_seconds: float | None = None, engine: str = "tracklet_aggregation",
          mode: str = "offline_fast", config: str = "configs/default.yaml",
-         run_id: str = "", cache_policy: str = "reuse") -> None:
+         run_id: str = "", cache_policy: str = "reuse",
+         download_artifacts: bool = False) -> None:
     if mode != "offline_fast":
         raise ValueError("The batch runner only supports offline_fast; UI realtime is separate")
     if cache_policy not in ("reuse", "refresh") or engine not in ("legacy", "directional_grid", "tracklet_aggregation", "shadow"):
@@ -100,20 +189,46 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", run_id):
         raise ValueError("run_id must contain only letters, numbers, underscores, hyphens")
     local_output = Path("outputs/common_path") / run_id
-    if local_output.exists():
+    if download_artifacts and local_output.exists():
         raise FileExistsError(local_output)
     source_hash, model_hash = _sha256(source), _sha256(model)
+    # Resolve local `extends` profiles before sending the single immutable
+    # config payload to the ephemeral worker.
+    import yaml
+    from backend.app.core.config import load_config
+    resolved_config_text = yaml.safe_dump(
+        load_config(settings).model_dump(mode="json"),
+        sort_keys=False,
+    )
     remote_input = f"common_path/inputs/{source_hash}.mp4"
     try:
         listing = _cli("ls", VOLUME_NAME, "common_path/inputs")
     except subprocess.CalledProcessError:
         listing = ""
     if cache_policy == "refresh" or f"{source_hash}.mp4" not in listing:
-        _cli("put", VOLUME_NAME, str(source), remote_input)
-    manifest = gpu_clip.remote(source_hash, model_hash, settings.read_text(encoding="utf-8"),
+        # Modal Volume refuses overwriting an existing path unless --force is
+        # explicit. Refresh is intentionally an overwrite; reuse remains
+        # immutable and skips the upload when the hashed object exists.
+        upload_args = ["put", VOLUME_NAME, str(source), remote_input]
+        if cache_policy == "refresh":
+            upload_args.insert(1, "--force")
+        _cli(*upload_args)
+    manifest = gpu_clip.remote(source_hash, model_hash, resolved_config_text,
                                start_seconds, duration_seconds, engine, run_id)
     if manifest.get("status") != "success":
         raise RuntimeError(f"Remote run failed: {manifest}")
+    remote_path = f"{VOLUME_NAME}:common_path/runs/{run_id}"
+    if not download_artifacts:
+        print(json.dumps({
+            "status": "gpu_completed",
+            "run_id": run_id,
+            "remote_path": remote_path,
+            "manifest": manifest,
+            "next_command": (
+                f"python scripts/download_modal_artifacts.py --run-id {run_id}"
+            ),
+        }, indent=2))
+        return
     local_output.mkdir(parents=True, exist_ok=False)
     for filename in [*manifest["artifacts"], "manifest.json"]:
         if Path(filename).name != filename:

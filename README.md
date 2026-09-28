@@ -60,6 +60,17 @@ python -m pip install -e ".[dev]"
 python -m uvicorn backend.main:app --reload --port 8000
 ```
 
+For the Shibuya high-recall profile (tiled person detection and up to three
+Common Paths), start the backend with:
+
+```powershell
+$env:CROWD_CONFIG = "configs/shibuya.yaml"
+python -m uvicorn backend.main:app --reload --port 8000
+```
+
+The Common Path limit can then be changed from the dashboard without resetting
+the tracker. The detector profile remains separate from the display limit.
+
 **Terminal 2 (Frontend):**
 ```powershell
 cd frontend
@@ -100,6 +111,15 @@ modal run --quiet --timestamps modal_common_path.py `
   --config configs/shibuya.yaml `
   --run-id my-video-tracklet-20260922 `
   --cache-policy reuse
+```
+
+`modal run` chỉ chạy GPU, commit kết quả lên Volume rồi kết thúc; nó không tự tải
+video/cache lớn về máy. Sau khi lệnh in `run_id`, tải riêng bằng:
+
+```powershell
+python scripts/download_modal_artifacts.py `
+  --run-id my-video-tracklet-20260922 `
+  --output-dir outputs/common_path/my-video-tracklet-20260922
 ```
 
 ---

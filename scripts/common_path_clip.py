@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import math
+import platform
 import statistics
+import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Sequence
 
 import cv2
 import numpy as np
@@ -25,6 +29,13 @@ from backend.app.analytics.spatial import SpatialTransformer
 from backend.app.core.config import load_config
 from backend.app.schemas import CommonPathSnapshot, Detection, TrackedObject
 from backend.app.video.renderer import FrameRenderer, OverlayOptions
+from backend.app.video.motion_roi import MotionROIPlan, MotionROIPlanner
+
+
+CACHE_SCHEMA = "detections-tracklets-v1"
+SCHEDULER_SCHEMA = "motion-roi-scheduler-v1"
+PROVENANCE_SCHEMA = "common-path-provenance-v2"
+DIAGNOSTIC_REGIONS = ("upper", "middle", "lower")
 
 
 def digest(path: Path) -> str:
@@ -35,19 +46,409 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def _canonical_digest(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _motion_roi_payload(config: object) -> dict[str, object]:
+    motion = getattr(config, "motion_roi", None)
+    if motion is None:
+        return {"enabled": False, "shadow_mode": False}
+    payload = motion.model_dump(mode="json")
+    # Logging and overlay choices do not change detector/tracker observations,
+    # so they must not invalidate an otherwise reusable upstream cache.
+    payload.pop("diagnostics", None)
+    return payload
+
+
+def scheduler_fingerprint(config: object) -> str:
+    return _canonical_digest({
+        "schema": SCHEDULER_SCHEMA,
+        "algorithm": "reference-or-existing-tile-mog2-v1",
+        "motion_roi": _motion_roi_payload(config),
+    })
+
+
+def _code_fingerprint() -> str:
+    root = Path(__file__).resolve().parents[1]
+    relative_paths = (
+        "scripts/common_path_clip.py",
+        "backend/app/core/config.py",
+        "backend/app/inference/ultralytics_detector.py",
+        "backend/app/tracking/bytetrack_tracker.py",
+        "backend/app/video/motion_roi.py",
+    )
+    result = hashlib.sha256()
+    for relative in relative_paths:
+        path = root / relative
+        if not path.is_file():
+            continue
+        result.update(relative.encode("utf-8"))
+        result.update(b"\0")
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                result.update(chunk)
+    return result.hexdigest()
+
+
+def _package_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {
+        "python": platform.python_version(),
+        "opencv": cv2.__version__,
+        "numpy": np.__version__,
+    }
+    for package in ("ultralytics", "torch", "pydantic", "psutil"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def _diagnostic_region_index(y: float, height: int) -> int:
+    if height <= 0:
+        return 0
+    return min(2, max(0, int(3.0 * float(y) / float(height))))
+
+
+def _rect_union_area(rectangles: Sequence[Sequence[float]], bounds: Sequence[float]) -> float:
+    bx1, by1, bx2, by2 = map(float, bounds)
+    clipped: list[tuple[float, float, float, float]] = []
+    for rectangle in rectangles:
+        x1 = max(bx1, float(rectangle[0]))
+        y1 = max(by1, float(rectangle[1]))
+        x2 = min(bx2, float(rectangle[2]))
+        y2 = min(by2, float(rectangle[3]))
+        if x2 > x1 and y2 > y1:
+            clipped.append((x1, y1, x2, y2))
+    if not clipped:
+        return 0.0
+    xs = sorted({x for item in clipped for x in (item[0], item[2])})
+    area = 0.0
+    for left, right in zip(xs, xs[1:]):
+        intervals = sorted(
+            (top, bottom)
+            for x1, top, x2, bottom in clipped
+            if x1 < right and x2 > left
+        )
+        covered = 0.0
+        if intervals:
+            start, end = intervals[0]
+            for top, bottom in intervals[1:]:
+                if top <= end:
+                    end = max(end, bottom)
+                else:
+                    covered += end - start
+                    start, end = top, bottom
+            covered += end - start
+        area += (right - left) * covered
+    return area
+
+
+def _box_fully_searched(box: Sequence[float], searched_regions: Sequence[Sequence[float]]) -> bool:
+    x1, y1, x2, y2 = map(float, box)
+    box_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if box_area <= 0.0:
+        return False
+    covered = _rect_union_area(searched_regions, (x1, y1, x2, y2))
+    return covered >= box_area * (1.0 - 1e-6)
+
+
+def _plan_to_dict(plan: MotionROIPlan | None, *, width: int, height: int,
+                  motion_enabled: bool) -> dict[str, object]:
+    return _as_plan_dict(
+        plan,
+        width=width,
+        height=height,
+        tiled=True,
+        motion_enabled=motion_enabled,
+    )
+
+
+def _as_plan_dict(plan: object | None, *, width: int, height: int,
+                  tiled: bool, motion_enabled: bool) -> dict[str, object]:
+    """Normalize an optional scheduler plan without coupling the runner to it.
+
+    The reference detector predates MotionROIPlanner.  Emitting an explicit
+    reference decision for that path is preferable to silently leaving a hole
+    in the diagnostic timeline, while fields that cannot be measured remain
+    marked as such instead of being guessed.
+    """
+    if plan is not None:
+        value = plan.to_dict() if callable(getattr(plan, "to_dict", None)) else dict(plan) \
+            if isinstance(plan, dict) else {}
+        if value:
+            value.setdefault("searched_regions", [[0, 0, width, height]])
+            value.setdefault("scan_type", "reference")
+            value.setdefault("proposed_scan_type", value["scan_type"])
+            value.setdefault("state", "FULL_COVERAGE")
+            value.setdefault("reasons", [])
+            value.setdefault("selected_tiles", [])
+            value.setdefault("motion_tiles", [])
+            value.setdefault("protected_tiles", [])
+            value.setdefault("foreground_ratio", None)
+            value.setdefault("roi_union_ratio", None)
+            value.setdefault("estimated_cost_ratio", None)
+            value.setdefault("motion_ms", None)
+            value.setdefault("planning_ms", None)
+            value.setdefault("shadow_mode", False)
+            return value
+    return {
+        "state": "REFERENCE",
+        "scan_type": "reference",
+        "proposed_scan_type": "reference",
+        "reasons": ["MOTION_ROI_DISABLED" if not motion_enabled else "PLANNER_NOT_EXPOSED"],
+        "selected_tiles": [],
+        "searched_regions": [[0, 0, width, height]],
+        "motion_tiles": [],
+        "protected_tiles": [],
+        "foreground_ratio": None,
+        "roi_union_ratio": 1.0,
+        "estimated_cost_ratio": None,
+        "learning_rate": None,
+        "motion_ms": None,
+        "planning_ms": None,
+        "mask_shape": None,
+        "shadow_mode": False,
+    }
+
+
+def _plan_regions(plan: dict[str, object], width: int, height: int) -> list[list[float]]:
+    regions = plan.get("searched_regions")
+    if not isinstance(regions, list):
+        return [[0, 0, width, height]]
+    # An empty list is an intentional no-search decision.  Do not turn a
+    # scheduler skip into full-frame coverage in the diagnostics layer.
+    if not regions:
+        return []
+    result: list[list[float]] = []
+    for region in regions:
+        if isinstance(region, (list, tuple)) and len(region) == 4:
+            try:
+                result.append([float(value) for value in region])
+            except (TypeError, ValueError):
+                continue
+    return result or [[0, 0, width, height]]
+
+
+def _detector_workload(detector: object | None, config: object, frame_shape: Sequence[int],
+                       plan: dict[str, object]) -> dict[str, object]:
+    """Read optional detector instrumentation, otherwise report unknowns.
+
+    It is intentionally unsafe to infer tensor dimensions from source ROI
+    area.  The artifact records that those fields were not instrumented yet so
+    a benchmark cannot mistake an estimate for measured GPU work.
+    """
+    stats = getattr(detector, "last_inference_stats", None)
+    if callable(stats):
+        stats = stats()
+    if not isinstance(stats, dict):
+        stats = {}
+    scan_type = str(plan.get("scan_type", "reference"))
+    detector_config = config.detector
+    reference_images = (
+        detector_config.tile_rows * detector_config.tile_columns
+        + int(detector_config.tile_include_full_frame)
+        if detector_config.tiled_inference else 1
+    )
+    fallback_images = reference_images if scan_type == "reference" else len(plan.get("selected_tiles", ()))
+    return {
+        "model_invocations": stats.get("model_invocations", 1 if detector is not None else 0),
+        "inference_images": stats.get("inference_images", fallback_images if detector is not None else 0),
+        "batch_size": stats.get("batch_size"),
+        "actual_tensor_shapes": stats.get("actual_tensor_shapes", []),
+        "sum_tensor_pixels": stats.get("sum_tensor_pixels"),
+        "padding_overhead_pixels": stats.get("padding_overhead_pixels"),
+        "workload_source": stats.get("workload_source", "instrumented" if stats else "not_instrumented"),
+        "source_frame_shape": list(frame_shape),
+    }
+
+
+def _coverage_for_tracks(tracks: Sequence[object], plan: dict[str, object], width: int,
+                         height: int) -> list[dict[str, object]]:
+    searched = _plan_regions(plan, width, height)
+    counts = {
+        region: {"MEASURED": 0, "SEARCHED_NOT_FOUND": 0, "NOT_SEARCHED_BY_POLICY": 0}
+        for region in DIAGNOSTIC_REGIONS
+    }
+    ages: dict[str, list[float]] = {region: [] for region in DIAGNOSTIC_REGIONS}
+    for track in tracks:
+        x = float(getattr(track, "bottom_center", (0.0, 0.0))[0])
+        y = float(getattr(track, "bottom_center", (0.0, 0.0))[1])
+        region = DIAGNOSTIC_REGIONS[_diagnostic_region_index(y, height)]
+        box = (
+            float(getattr(track, "x1", 0.0)), float(getattr(track, "y1", 0.0)),
+            float(getattr(track, "x2", 0.0)), float(getattr(track, "y2", 0.0)),
+        )
+        declared_state = getattr(track, "observation_coverage", None)
+        if declared_state in counts[region]:
+            state = declared_state
+        elif bool(getattr(track, "observed", True)):
+            state = "MEASURED"
+        elif _box_fully_searched(box, searched):
+            state = "SEARCHED_NOT_FOUND"
+        else:
+            state = "NOT_SEARCHED_BY_POLICY"
+        counts[region][state] += 1
+        # Track objects currently do not expose a last-observation age. Keep
+        # the column explicit and avoid manufacturing a value from wall time.
+        if hasattr(track, "observation_age_s"):
+            try:
+                ages[region].append(float(track.observation_age_s))
+            except (TypeError, ValueError):
+                pass
+    rows: list[dict[str, object]] = []
+    for region in DIAGNOSTIC_REGIONS:
+        row = {"region_id": region, **counts[region]}
+        values = ages[region]
+        row.update({
+            "track_count": sum(counts[region].values()),
+            "observation_age_p50_s": round(float(np.percentile(values, 50)), 4) if values else None,
+            "observation_age_p95_s": round(float(np.percentile(values, 95)), 4) if values else None,
+            "observation_age_max_s": round(max(values), 4) if values else None,
+            "age_status": "measured" if values else "not_available",
+        })
+        rows.append(row)
+    return rows
+
+
+def _label_track_coverage(tracks: Sequence[TrackedObject], plan: dict[str, object],
+                          width: int, height: int) -> list[TrackedObject]:
+    searched = _plan_regions(plan, width, height)
+    scan_type = str(plan.get("scan_type", "reference"))
+    labeled: list[TrackedObject] = []
+    for track in tracks:
+        if track.observed:
+            state = "MEASURED"
+        elif scan_type == "skip":
+            state = "NOT_SEARCHED_BY_POLICY"
+        elif _box_fully_searched(track.xyxy, searched):
+            state = "SEARCHED_NOT_FOUND"
+        else:
+            state = "NOT_SEARCHED_BY_POLICY"
+        labeled.append(replace(track, observation_coverage=state))
+    return labeled
+
+
+def _write_jsonl(path: Path, rows: Sequence[object]) -> None:
+    with path.open("w", encoding="utf-8") as sink:
+        for row in rows:
+            sink.write(json.dumps(row, separators=(",", ":"), ensure_ascii=True) + "\n")
+
+
+def _write_csv_rows(path: Path, rows: Sequence[dict[str, object]], fieldnames: Sequence[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as sink:
+        writer = csv.DictWriter(sink, fieldnames=list(fieldnames), extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _percentile(values: Sequence[object], percentile: float) -> float | None:
+    numeric = [float(value) for value in values if value is not None]
+    if not numeric:
+        return None
+    return round(float(np.percentile(numeric, percentile)), 3)
+
+
+def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]]) -> None:
+    """Write stage percentiles and bounded video-time windows from one run."""
+    stages = (
+        ("decode", "decode_ms"),
+        ("detector_model", "model_predict_ms"),
+        ("detector_postprocess_merge", "postprocess_ms"),
+        ("inference_total", "inference_ms"),
+        ("tracking", "tracking_ms"),
+        ("common_path", "analytics_ms"),
+        ("common_path_compute", "common_path_compute_ms"),
+        ("render", "render_ms"),
+        ("encode", "encode_ms"),
+        ("cache_write", "cache_write_ms"),
+        ("frame_total", "frame_total_ms"),
+    )
+    stage_rows = []
+    for name, field in stages:
+        values = [row.get(field) for row in timings]
+        numeric = [float(value) for value in values if value is not None]
+        if not numeric:
+            continue
+        stage_rows.append({
+            "stage": name,
+            "field": field,
+            "samples": len(numeric),
+            "mean_ms": round(float(np.mean(numeric)), 3),
+            "p50_ms": _percentile(numeric, 50),
+            "p95_ms": _percentile(numeric, 95),
+            "max_ms": round(max(numeric), 3),
+            "total_ms": round(sum(numeric), 3),
+        })
+    _write_csv_rows(
+        output_dir / "stage_metrics.csv", stage_rows,
+        ("stage", "field", "samples", "mean_ms", "p50_ms", "p95_ms", "max_ms", "total_ms"),
+    )
+
+    windows: dict[int, list[dict[str, object]]] = {}
+    for row in timings:
+        window = int(float(row.get("event_time_s", 0.0)) // 60.0)
+        windows.setdefault(window, []).append(row)
+    window_rows = []
+    for window, rows in sorted(windows.items()):
+        timestamps = [float(row["event_time_s"]) for row in rows]
+        span = max(timestamps[-1] - timestamps[0], 1e-9)
+        def mean(field: str) -> float | None:
+            values = [float(row[field]) for row in rows if row.get(field) is not None]
+            return round(float(np.mean(values)), 3) if values else None
+        def peak(field: str) -> float | None:
+            values = [float(row[field]) for row in rows if row.get(field) is not None]
+            return round(max(values), 3) if values else None
+        window_rows.append({
+            "window_start_s": round(window * 60.0, 3),
+            "window_end_s": round(window * 60.0 + 60.0, 3),
+            "frames": len(rows),
+            "media_span_s": round(span, 3),
+            "processing_fps": round(len(rows) / span, 3),
+            "inference_mean_ms": mean("inference_ms"),
+            "tracking_mean_ms": mean("tracking_ms"),
+            "common_path_mean_ms": mean("analytics_ms"),
+            "render_mean_ms": mean("render_ms"),
+            "encode_mean_ms": mean("encode_ms"),
+            "frame_total_mean_ms": mean("frame_total_ms"),
+            "detections_mean": mean("detections"),
+            "tracks_mean": mean("tracks"),
+            "tracklet_buffered_peak": peak("tracklet_buffered_segments"),
+            "tracklet_candidates_peak": peak("tracklet_candidates"),
+            "ram_peak_mb": peak("ram_mb"),
+        })
+    _write_csv_rows(
+        output_dir / "long_run_metrics.csv", window_rows,
+        ("window_start_s", "window_end_s", "frames", "media_span_s", "processing_fps",
+         "inference_mean_ms", "tracking_mean_ms", "common_path_mean_ms", "render_mean_ms",
+         "encode_mean_ms", "frame_total_mean_ms", "detections_mean", "tracks_mean",
+         "tracklet_buffered_peak", "tracklet_candidates_peak", "ram_peak_mb"),
+    )
+
+
 def cache_key(input_hash: str, model_hash: str, config: object, start: float,
               duration: float | None) -> str:
-    data = dict(schema="detections-tracklets-v1", input_hash=input_hash,
+    data = dict(schema=CACHE_SCHEMA, input_hash=input_hash,
                 model_hash=model_hash, start=start, duration=duration,
                 detector=config.detector.model_dump(exclude={"device", "model"}),
                 tracker=config.tracker.model_dump())
+    motion = getattr(config, "motion_roi", None)
+    if motion is not None and (motion.enabled or motion.shadow_mode):
+        # A hybrid run observes a different subset of the source than a
+        # reference run.  Never allow a full-coverage cache to masquerade as a
+        # scheduler cache.  Disabled production configs retain the historical
+        # key shape for backwards-compatible replay.
+        data["scheduler_fingerprint"] = scheduler_fingerprint(config)
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
 def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Path | None,
         start_seconds: float, duration_seconds: float | None, run_id: str, engine: str,
         replay_cache: Path | None = None, input_hash: str | None = None,
-        model_hash: str | None = None, rebuild_tracks: bool = False) -> dict:
+        model_hash: str | None = None, rebuild_tracks: bool = False,
+        allow_cache_key_mismatch: bool = False) -> dict:
     if start_seconds < 0:
         raise ValueError("Start must be >=0 seconds")
     if duration_seconds is not None and duration_seconds <= 0:
@@ -89,6 +490,14 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     input_hash = input_hash or digest(input_path)
     model_hash = model_hash or (digest(model_path) if model_path else "unknown")
     key = cache_key(input_hash, model_hash, config, start_seconds, duration_seconds)
+    config_hash = _canonical_digest(config.model_dump(mode="json"))
+    scheduler_hash = scheduler_fingerprint(config)
+    code_hash = _code_fingerprint()
+    motion_config = getattr(config, "motion_roi", None)
+    motion_enabled = bool(
+        motion_config is not None and (motion_config.enabled or motion_config.shadow_mode)
+    )
+    motion_scheduler = MotionROIPlanner(motion_config) if motion_enabled else None
     cache_path = output_dir / "tracking_cache.jsonl" if replay_cache is None else replay_cache
     if rebuild_tracks and replay_cache is None:
         raise ValueError("--rebuild-tracks requires --replay-cache")
@@ -109,11 +518,16 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         )
         detector = UltralyticsPersonDetector(detection_config)
         tracker = ByteTrackTracker(config.tracker)
-    else:
+    cache_key_match: bool | None = None
+    if replay_cache is not None:
         meta_path = replay_cache.with_suffix(".meta.json")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta["cache_key"] != key:
-            raise ValueError("Tracking cache key mismatch; inference/tracker/input/clip changed")
+        cache_key_match = meta.get("cache_key") == key
+        if not cache_key_match:
+            if not allow_cache_key_mismatch:
+                raise ValueError("Tracking cache key mismatch; inference/tracker/input/clip changed")
+            if meta.get("source_hash") != input_hash or meta.get("model_hash") != model_hash:
+                raise ValueError("Cache key override requires matching source and model hashes")
         if rebuild_tracks:
             from backend.app.tracking import ByteTrackTracker
             tracker = ByteTrackTracker(config.tracker)
@@ -130,18 +544,35 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     legacy_snapshot = CommonPathSnapshot(0.0, ())
     first_frame: np.ndarray | None = None
     last_frame: np.ndarray | None = None
+    last_tracks: tuple[TrackedObject, ...] = ()
     last_time = start_seconds
     start_frame = round(start_seconds * fps)
     source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 10**9
     end_frame = source_frame_count if duration_seconds is None else min(
         round((start_seconds + duration_seconds) * fps), source_frame_count)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    cache_reader = replay_cache.open("r", encoding="utf-8") if replay_cache else None
-    cache_writer = cache_path.open("w", encoding="utf-8") if replay_cache is None else None
+    cache_reader = (
+        replay_cache.open("r", encoding="utf-8", buffering=1024 * 1024)
+        if replay_cache else None
+    )
+    cache_writer = (
+        cache_path.open("w", encoding="utf-8", buffering=1024 * 1024)
+        if replay_cache is None else None
+    )
     rebuilt_cache_path = output_dir / "tracking_cache_rebuilt.jsonl" if rebuild_tracks else None
     rebuilt_cache_writer = (rebuilt_cache_path.open("w", encoding="utf-8")
                             if rebuilt_cache_path else None)
     point_type = TrackletPoint if selected == "tracklet_aggregation" else GridTrackPoint
+    scheduler_decisions: list[dict[str, object]] = []
+    coverage_rows: list[dict[str, object]] = []
+    region_funnel_rows: list[dict[str, object]] = []
+    candidate_decisions: list[dict[str, object]] = []
+    path_support_rows: list[dict[str, object]] = []
+    seen_candidate_diagnostics: set[str] = set()
+    seen_path_support_diagnostics: set[str] = set()
+    seen_track_ids: set[int] = set()
+    diagnostic_limit = int(getattr(getattr(motion_config, "diagnostics", None), "max_decisions", 10000))
+    diagnostic_stride = max(1, math.ceil(max(1, end_frame - start_frame) / diagnostic_limit))
     began = time.perf_counter()
     try:
         for frame_id in range(start_frame, end_frame):
@@ -157,43 +588,251 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             if timestamp < last_time:
                 raise ValueError("Media timestamps moved backwards")
             last_time = timestamp
+            entry: dict[str, Any] | None = None
+            executed_plan: object | None = None
+            detector_images = 0
+            detector_stats: dict[str, object] = {}
             if cache_reader:
                 entry = json.loads(cache_reader.readline())
                 if entry["frame_id"] != frame_id:
                     raise ValueError("Replay cache frame mismatch")
                 timestamp = entry["event_time_s"]
                 detections = [Detection(**d) for d in entry["detections"]]
+                executed_plan = entry.get("scheduler_decision")
                 inference_ms = 0.
                 if rebuild_tracks:
                     t1 = time.perf_counter()
-                    tracks = tracker.update(detections, frame)
+                    cached_scan_type = (
+                        str(executed_plan.get("scan_type", "reference"))
+                        if isinstance(executed_plan, dict) else "reference"
+                    )
+                    if cached_scan_type == "skip":
+                        tracks = tracker.coast(frame, frame_id=frame_id)
+                    else:
+                        tracks = tracker.update(detections, frame, frame_id=frame_id)
                     tracking_ms = (time.perf_counter() - t1) * 1000
-                    rebuilt_cache_writer.write(json.dumps(dict(
-                        frame_id=frame_id, event_time_s=timestamp,
-                        detections=[asdict(d) for d in detections],
-                        tracks=[asdict(t) for t in tracks],
-                    )) + "\n")
                 else:
                     tracks = [TrackedObject(**t) for t in entry["tracks"]]
                     tracking_ms = 0.
             else:
                 import torch
-                torch.cuda.synchronize()
+                if motion_scheduler is not None:
+                    tile_provider = getattr(detector, "tile_regions", None)
+                    tile_regions = (
+                        tuple(tile_provider(width, height)) if callable(tile_provider) else ()
+                    )
+                    image_count_provider = getattr(detector, "reference_image_count", None)
+                    reference_image_count = (
+                        int(image_count_provider(width, height))
+                        if callable(image_count_provider) else 1
+                    )
+                    executed_plan = motion_scheduler.plan(
+                        frame,
+                        timestamp,
+                        tile_regions=tile_regions,
+                        reference_image_count=reference_image_count,
+                        protected_boxes=tuple(
+                            (int(track.x1), int(track.y1), int(track.x2), int(track.y2))
+                            for track in last_tracks
+                        ),
+                    )
+                    if (
+                        executed_plan.scan_type == "tiles"
+                        and any(
+                            not _box_fully_searched(track.xyxy, executed_plan.searched_regions)
+                            for track in last_tracks
+                        )
+                    ):
+                        # BYTETracker.update treats an unmatched track as a
+                        # searched miss.  A selective pass is only safe when
+                        # every existing predicted bbox is fully covered by the
+                        # union of selected tiles; partial overlap is not enough.
+                        executed_plan = replace(
+                            executed_plan,
+                            scan_type="reference",
+                            searched_regions=((0, 0, width, height),),
+                            reasons=executed_plan.reasons
+                            + ("TRACK_COVERAGE_REFERENCE_FALLBACK",),
+                        )
+                scan_type = (
+                    str(getattr(executed_plan, "scan_type", "reference"))
+                    if executed_plan is not None else "reference"
+                )
                 t1 = time.perf_counter()
-                detections = detector.detect(frame)
-                torch.cuda.synchronize()
+                if scan_type == "reference":
+                    torch.cuda.synchronize()
+                    detections = detector.detect(frame)
+                    torch.cuda.synchronize()
+                    detector_images = (
+                        int(detector.reference_image_count(width, height))
+                        if callable(getattr(detector, "reference_image_count", None)) else 1
+                    )
+                elif scan_type == "tiles":
+                    region_detector = getattr(detector, "detect_regions", None)
+                    if not callable(region_detector):
+                        torch.cuda.synchronize()
+                        detections = detector.detect(frame)
+                        torch.cuda.synchronize()
+                        detector_images = (
+                            int(detector.reference_image_count(width, height))
+                            if callable(getattr(detector, "reference_image_count", None)) else 1
+                        )
+                        executed_plan = replace(
+                            executed_plan,
+                            scan_type="reference",
+                            searched_regions=((0, 0, width, height),),
+                            reasons=executed_plan.reasons + ("BACKEND_REFERENCE_FALLBACK",),
+                        )
+                        scan_type = "reference"
+                    else:
+                        torch.cuda.synchronize()
+                        detections = region_detector(frame, executed_plan.selected_tiles)
+                        torch.cuda.synchronize()
+                        detector_images = len(executed_plan.selected_tiles)
+                else:
+                    detections = []
+                detector_stats = dict(getattr(detector, "last_inference_stats", {}) or {})
                 inference_ms = (time.perf_counter() - t1) * 1000
                 t1 = time.perf_counter()
-                tracks = tracker.update(detections, frame)
+                if scan_type == "skip":
+                    coast = getattr(tracker, "coast", None)
+                    if not callable(coast):
+                        raise RuntimeError(
+                            "motion ROI skip requires tracker.coast; refusing update([]) semantics"
+                        )
+                    tracks = coast(frame, frame_id=frame_id)
+                else:
+                    tracks = tracker.update(detections, frame, frame_id=frame_id)
                 tracking_ms = (time.perf_counter() - t1) * 1000
-                cache_writer.write(json.dumps(dict(frame_id=frame_id, event_time_s=timestamp,
-                    detections=[asdict(d) for d in detections],
-                    tracks=[asdict(t) for t in tracks])) + "\n")
+
+            exposed_plan = executed_plan
+            if exposed_plan is None and entry is not None:
+                exposed_plan = entry.get("scheduler_decision")
+            if exposed_plan is None and detector is not None:
+                exposed_plan = getattr(detector, "last_scheduler_decision", None)
+            plan = _as_plan_dict(
+                exposed_plan,
+                width=width,
+                height=height,
+                tiled=config.detector.tiled_inference,
+                motion_enabled=motion_enabled,
+            )
+            tracks = _label_track_coverage(tracks, plan, width, height)
+            workload = _detector_workload(detector, config, frame.shape, plan)
+            if replay_cache is None:
+                skipped = str(plan.get("scan_type")) == "skip"
+                workload["model_invocations"] = 0 if skipped else int(
+                    workload.get("model_invocations") or 1
+                )
+                workload["inference_images"] = 0 if skipped else detector_images
+                if skipped:
+                    workload["batch_size"] = 0
+                    workload["actual_tensor_shapes"] = []
+                    workload["sum_tensor_pixels"] = 0
+                    workload["padding_overhead_pixels"] = 0
+                    workload["workload_source"] = "intentional_skip"
+            plan_record = {
+                "schema": SCHEDULER_SCHEMA,
+                "frame_id": frame_id,
+                "event_time_s": round(timestamp, 6),
+                "scheduler_fingerprint": scheduler_hash,
+                **plan,
+                **workload,
+            }
+            coverage = _coverage_for_tracks(tracks, plan, width, height)
+            coverage_by_track: list[dict[str, object]] = []
+            searched_regions = _plan_regions(plan, width, height)
+            for track in tracks:
+                if track.observed:
+                    coverage_state = "MEASURED"
+                elif _box_fully_searched(track.xyxy, searched_regions):
+                    coverage_state = "SEARCHED_NOT_FOUND"
+                else:
+                    coverage_state = "NOT_SEARCHED_BY_POLICY"
+                coverage_by_track.append({"track_id": track.track_id, "state": coverage_state})
+
+            cache_row = dict(
+                frame_id=frame_id,
+                event_time_s=timestamp,
+                detections=[asdict(d) for d in detections],
+                tracks=[asdict(t) for t in tracks],
+                scheduler_decision=plan_record,
+                observation_coverage=coverage_by_track,
+            )
+            cache_write_started = time.perf_counter()
+            if cache_writer is not None:
+                cache_writer.write(json.dumps(cache_row, separators=(",", ":")) + "\n")
+            if rebuilt_cache_writer is not None:
+                rebuilt_cache_writer.write(json.dumps(cache_row, separators=(",", ":")) + "\n")
+            cache_write_ms = (time.perf_counter() - cache_write_started) * 1000
+
+            should_log_diagnostics = (frame_id - start_frame) % diagnostic_stride == 0
+            if should_log_diagnostics:
+                scheduler_decisions.append(plan_record)
+                measured_by_region = {
+                    row["region_id"]: row for row in coverage
+                }
+                detection_counts = {region: 0 for region in DIAGNOSTIC_REGIONS}
+                new_track_counts = {region: 0 for region in DIAGNOSTIC_REGIONS}
+                for detection in detections:
+                    region = DIAGNOSTIC_REGIONS[_diagnostic_region_index(detection.y2, height)]
+                    detection_counts[region] += 1
+                for track in tracks:
+                    if track.track_id not in seen_track_ids:
+                        region = DIAGNOSTIC_REGIONS[
+                            _diagnostic_region_index(track.bottom_center[1], height)
+                        ]
+                        new_track_counts[region] += 1
+                region_height = height / 3.0
+                for region_index, region in enumerate(DIAGNOSTIC_REGIONS):
+                    bounds = (0.0, region_index * region_height, float(width),
+                              min(float(height), (region_index + 1) * region_height))
+                    region_area = max(1.0, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]))
+                    coverage_ratio = _rect_union_area(searched_regions, bounds) / region_area
+                    coverage_row = {
+                        "frame_id": frame_id,
+                        "event_time_s": round(timestamp, 6),
+                        "region_id": region,
+                        "region_definition": "equal_height_diagnostic_band",
+                        "sample_stride_frames": diagnostic_stride,
+                        "coverage_ratio": round(min(1.0, coverage_ratio), 6),
+                        "detections": detection_counts[region],
+                        "new_track_ids": new_track_counts[region],
+                        **measured_by_region[region],
+                        "deadline_violations": None,
+                        "grace_expirations": None,
+                        "limitations": "age/deadline unavailable from current tracker contract",
+                    }
+                    coverage_rows.append(coverage_row)
+                    region_funnel_rows.append({
+                        "frame_id": frame_id,
+                        "event_time_s": round(timestamp, 6),
+                        "region_id": region,
+                        "region_definition": "equal_height_diagnostic_band",
+                        "detections": detection_counts[region],
+                        "observed_tracks": measured_by_region[region]["MEASURED"],
+                        "predicted_only_tracks": (
+                            measured_by_region[region]["SEARCHED_NOT_FOUND"]
+                            + measured_by_region[region]["NOT_SEARCHED_BY_POLICY"]
+                        ),
+                        "new_track_ids": new_track_counts[region],
+                        "tracklet_deltas_in": None,
+                        "tracklet_deltas_accepted": None,
+                        "rejected_by_reason": None,
+                        "accepted_motion_segments": None,
+                        "candidate_count_before_top_k": None,
+                        "selected_path_count": None,
+                        "supported_path_length_px": None,
+                        "diagnostic_status": "UPSTREAM_ONLY_DOWNSTREAM_NOT_INSTRUMENTED",
+                    })
+            seen_track_ids.update(track.track_id for track in tracks)
             count_tracks.update(t.track_id for t in tracks)
+            last_tracks = tuple(tracks)
             points = [point_type("cam01", run_id, t.track_id, 0, frame_id,
                                  timestamp, *t.bottom_center, observed=t.observed)
                       for t in tracks]
             t2 = time.perf_counter()
+            compute_count_before = len(tracklet.compute_ms) if tracklet is not None else 0
             if engine in ("directional_grid", "shadow"):
                 assert grid is not None
                 latest_snapshot = grid.update(points, timestamp)
@@ -214,7 +853,98 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                     active_track_ids=(t.track_id for t in tracks), timestamp=timestamp)
                 legacy_ms = (time.perf_counter() - legacy_started) * 1000
             analytics_ms = (time.perf_counter() - t2) * 1000
+            common_path_compute_ms = None
+            if tracklet is not None and len(tracklet.compute_ms) > compute_count_before:
+                common_path_compute_ms = float(tracklet.compute_ms[-1])
             snapshot = legacy_snapshot if selected == "legacy" else latest_snapshot
+            if should_log_diagnostics:
+                rejection_counts = (
+                    dict(getattr(tracklet, "rejections", {}))
+                    if tracklet is not None else {}
+                )
+                candidate_trace = getattr(tracklet, "candidate_decisions", ())
+                if isinstance(candidate_trace, Sequence) and candidate_trace:
+                    for decision in candidate_trace:
+                        if isinstance(decision, dict):
+                            trace_key = _canonical_digest(decision)
+                            if trace_key in seen_candidate_diagnostics:
+                                continue
+                            seen_candidate_diagnostics.add(trace_key)
+                            candidate_decisions.append({
+                                "frame_id": frame_id,
+                                "event_time_s": round(timestamp, 6),
+                                "trace_scope": "engine",
+                                **decision,
+                            })
+                else:
+                    candidate_decisions.append({
+                        "frame_id": frame_id,
+                        "event_time_s": round(timestamp, 6),
+                        "trace_scope": "snapshot_only",
+                        "candidate_count_before_top_k": getattr(tracklet, "candidate_count", None),
+                        "selected_path_count": len(snapshot.paths),
+                        "selected_path_ids": [path.path_id for path in snapshot.paths],
+                        "rejection_counts": rejection_counts,
+                        "decision_status": "ENGINE_TRACE_NOT_EXPOSED",
+                    })
+                support_trace = getattr(tracklet, "path_support_diagnostics", ())
+                if isinstance(support_trace, Sequence) and support_trace:
+                    for support in support_trace:
+                        if isinstance(support, dict):
+                            trace_key = _canonical_digest(support)
+                            if trace_key in seen_path_support_diagnostics:
+                                continue
+                            seen_path_support_diagnostics.add(trace_key)
+                            path_support_rows.append({
+                                "frame_id": frame_id,
+                                "event_time_s": round(timestamp, 6),
+                                **support,
+                                "trace_scope": "engine",
+                            })
+                else:
+                    for path in snapshot.paths:
+                        polyline = np.asarray(path.polyline, dtype=np.float64)
+                        length_px = float(np.linalg.norm(np.diff(polyline, axis=0), axis=1).sum()) \
+                            if len(polyline) > 1 else 0.0
+                        path_support_rows.append({
+                            "frame_id": frame_id,
+                            "event_time_s": round(timestamp, 6),
+                            "path_id": path.path_id,
+                            "revision": getattr(path, "revision", None),
+                            "rank": getattr(path, "rank", None),
+                            "sample_index": None,
+                            "s_norm": None,
+                            "x": None,
+                            "y": None,
+                            "raw_track_ids": None,
+                            "raw_segments": None,
+                            "observed_passage_support": path.support_tracks,
+                            "deduplicated_support": path.support_tracks,
+                            "weighted_support": path.score,
+                            "direction_agreement": path.confidence,
+                            "supported_length_px": round(length_px, 3),
+                            "evidence_coverage": None,
+                            "trace_scope": "whole_path_summary",
+                            "limitations": "local support/segment provenance unavailable from current CommonPath schema",
+                        })
+                if region_funnel_rows:
+                    candidate_count = getattr(tracklet, "candidate_count", None) if tracklet is not None else None
+                    selected_count = len(snapshot.paths)
+                    rejected_json = json.dumps(rejection_counts, sort_keys=True) if rejection_counts else None
+                    supported_length = sum(
+                        float(np.linalg.norm(np.diff(np.asarray(path.polyline, dtype=np.float64), axis=0), axis=1).sum())
+                        if len(path.polyline) > 1 else 0.0
+                        for path in snapshot.paths
+                    )
+                    for row in region_funnel_rows[-len(DIAGNOSTIC_REGIONS):]:
+                        row["candidate_count_before_top_k"] = candidate_count
+                        row["selected_path_count"] = selected_count
+                        row["rejected_by_reason"] = rejected_json
+                        row["supported_path_length_px"] = round(supported_length, 3)
+                        row["diagnostic_status"] = (
+                            "ENGINE_COUNTERS_ONLY" if tracklet is not None
+                            else "NO_COMMON_PATH_ENGINE"
+                        )
             t3 = time.perf_counter()
             rendered = renderer.render_point_only_frame(
                 frame, [SimpleNamespace(track_id=t.track_id, x=t.bottom_center[0],
@@ -232,13 +962,40 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                             cv2.FONT_HERSHEY_SIMPLEX, .65, (255, 255, 255), 2)
                 capture_frames.append(cv2.resize(rendered, (width // 3, height // 3)))
             frame_ids.append(frame_id)
+            frame_total_ms = (time.perf_counter() - t0) * 1000
             timings.append(dict(frame_id=frame_id, event_time_s=round(timestamp, 5),
                                 detections=len(detections), tracks=len(tracks), decode_ms=decode_ms,
                                 inference_ms=inference_ms, tracking_ms=tracking_ms,
+                                model_predict_ms=detector_stats.get("model_predict_ms"),
+                                postprocess_ms=detector_stats.get("postprocess_ms"),
+                                merge_ms=detector_stats.get("merge_ms"),
+                                motion_ms=plan.get("motion_ms"), planning_ms=plan.get("planning_ms"),
+                                roi_union_ratio=plan.get("roi_union_ratio"),
+                                scan_type=plan.get("scan_type"),
+                                model_invocations=workload.get("model_invocations"),
+                                inference_images=workload.get("inference_images"),
+                                sum_tensor_pixels=workload.get("sum_tensor_pixels"),
                                 directional_analytics_ms=directional_ms,
                                 legacy_analytics_ms=legacy_ms, analytics_ms=analytics_ms,
-                                render_ms=render_ms, encode_ms=encode_ms))
-            ram_samples_mb.append(psutil.Process().memory_info().rss / 1024**2)
+                                common_path_compute_ms=common_path_compute_ms,
+                                render_ms=render_ms, encode_ms=encode_ms,
+                                cache_write_ms=cache_write_ms,
+                                frame_total_ms=frame_total_ms,
+                                tracklet_buffered_segments=(
+                                    tracklet.buffered_segment_count if tracklet is not None else None
+                                ),
+                                tracklet_valid_tracklets=(
+                                    tracklet.rejections.get("VALID_TRACKLETS", 0)
+                                    if tracklet is not None else None
+                                ),
+                                tracklet_candidates=(
+                                    tracklet.candidate_count if tracklet is not None else None
+                                ),
+                                tracklet_link_cache_hits=(
+                                    tracklet.link_score_cache_hits if tracklet is not None else None
+                                ),
+                                ram_mb=psutil.Process().memory_info().rss / 1024**2))
+            ram_samples_mb.append(float(timings[-1]["ram_mb"]))
             last_frame = frame.copy()
     finally:
         cap.release()
@@ -253,11 +1010,36 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         raise RuntimeError("Clip has no decoded frames")
     if tracklet is not None:
         latest_snapshot = tracklet.finalize(last_time)
+        # Finalization may publish one last candidate/support revision after
+        # the final sampled frame. Export the engine-owned bounded traces below
+        # as an authoritative tail without duplicating earlier rows.
+        for decision in tracklet.candidate_decisions:
+            trace_key = _canonical_digest(decision)
+            if trace_key not in seen_candidate_diagnostics:
+                seen_candidate_diagnostics.add(trace_key)
+                candidate_decisions.append({"trace_scope": "engine_final", **decision})
+        for support in tracklet.path_support_diagnostics:
+            trace_key = _canonical_digest(support)
+            if trace_key not in seen_path_support_diagnostics:
+                seen_path_support_diagnostics.add(trace_key)
+                path_support_rows.append({"trace_scope": "engine_final", **support})
+    _write_jsonl(output_dir / "scheduler_decisions.jsonl", scheduler_decisions)
+    _write_jsonl(output_dir / "candidate_decisions.jsonl", candidate_decisions)
+    _write_jsonl(output_dir / "path_support.jsonl", path_support_rows)
+    scheduler_trace_hash = digest(output_dir / "scheduler_decisions.jsonl")
     if cache_writer is not None:
         cache_path.with_suffix(".meta.json").write_text(
             json.dumps(dict(cache_key=key, source_hash=input_hash, model_hash=model_hash,
                             start_seconds=start_seconds, duration_seconds=duration_seconds,
-                            frame_count=len(frame_ids)), indent=2), encoding="utf-8")
+                            frame_count=len(frame_ids), cache_schema=CACHE_SCHEMA,
+                            provenance_schema=PROVENANCE_SCHEMA,
+                            config_hash=config_hash, scheduler_fingerprint=scheduler_hash,
+                            scheduler_decision_trace_hash=scheduler_trace_hash,
+                            code_fingerprint=code_hash,
+                            motion_roi_enabled=motion_enabled,
+                            first_frame_id=frame_ids[0], last_frame_id=frame_ids[-1],
+                            first_event_time_s=timings[0]["event_time_s"],
+                            last_event_time_s=timings[-1]["event_time_s"]), indent=2), encoding="utf-8")
     if rebuilt_cache_path is not None:
         rebuilt_key = hashlib.sha256(f"{key}:tracklets-observed-v2".encode()).hexdigest()
         rebuilt_cache_path.with_suffix(".meta.json").write_text(
@@ -265,11 +1047,72 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                             source_hash=input_hash, model_hash=model_hash,
                             tracklet_schema="tracklets-observed-v2",
                             start_seconds=start_seconds, duration_seconds=duration_seconds,
-                            frame_count=len(frame_ids)), indent=2), encoding="utf-8")
+                            frame_count=len(frame_ids), provenance_schema=PROVENANCE_SCHEMA,
+                            config_hash=config_hash, scheduler_fingerprint=scheduler_hash,
+                            scheduler_decision_trace_hash=scheduler_trace_hash,
+                            code_fingerprint=code_hash), indent=2), encoding="utf-8")
     with (output_dir / "metrics.csv").open("w", newline="", encoding="utf-8") as sink:
         metrics_writer = csv.DictWriter(sink, fieldnames=list(timings[0]))
         metrics_writer.writeheader()
         metrics_writer.writerows(timings)
+    _write_stage_reports(output_dir, timings)
+    timing_by_frame = {int(item["frame_id"]): item for item in timings}
+    _write_csv_rows(
+        output_dir / "motion_roi_metrics.csv",
+        [
+            {
+                "frame_id": row["frame_id"],
+                "event_time_s": row["event_time_s"],
+                "state": row.get("state"),
+                "scan_type": row.get("scan_type"),
+                "proposed_scan_type": row.get("proposed_scan_type"),
+                "motion_ms": row.get("motion_ms"),
+                "planning_ms": row.get("planning_ms"),
+                "inference_ms": timing_by_frame.get(int(row["frame_id"]), {}).get("inference_ms"),
+                "tracking_ms": timing_by_frame.get(int(row["frame_id"]), {}).get("tracking_ms"),
+                "model_invocations": row.get("model_invocations"),
+                "inference_images": row.get("inference_images"),
+                "batch_size": row.get("batch_size"),
+                "actual_tensor_shapes": json.dumps(row.get("actual_tensor_shapes", [])),
+                "sum_tensor_pixels": row.get("sum_tensor_pixels"),
+                "padding_overhead_pixels": row.get("padding_overhead_pixels"),
+                "foreground_ratio": row.get("foreground_ratio"),
+                "roi_union_ratio": row.get("roi_union_ratio"),
+                "estimated_cost_ratio": row.get("estimated_cost_ratio"),
+                "workload_source": row.get("workload_source"),
+            }
+            for row in scheduler_decisions
+        ],
+        (
+            "frame_id", "event_time_s", "state", "scan_type", "proposed_scan_type",
+            "motion_ms", "planning_ms", "inference_ms", "tracking_ms",
+            "model_invocations", "inference_images", "batch_size", "actual_tensor_shapes",
+            "sum_tensor_pixels", "padding_overhead_pixels", "foreground_ratio",
+            "roi_union_ratio", "estimated_cost_ratio", "workload_source",
+        ),
+    )
+    _write_csv_rows(
+        output_dir / "observation_coverage_by_region.csv",
+        coverage_rows,
+        (
+            "frame_id", "event_time_s", "region_id", "region_definition",
+            "sample_stride_frames", "coverage_ratio", "detections", "new_track_ids",
+            "track_count", "MEASURED", "SEARCHED_NOT_FOUND", "NOT_SEARCHED_BY_POLICY",
+            "observation_age_p50_s", "observation_age_p95_s", "observation_age_max_s",
+            "age_status", "deadline_violations", "grace_expirations", "limitations",
+        ),
+    )
+    _write_csv_rows(
+        output_dir / "region_funnel.csv",
+        region_funnel_rows,
+        (
+            "frame_id", "event_time_s", "region_id", "region_definition", "detections",
+            "observed_tracks", "predicted_only_tracks", "new_track_ids", "tracklet_deltas_in",
+            "tracklet_deltas_accepted", "rejected_by_reason", "accepted_motion_segments",
+            "candidate_count_before_top_k", "selected_path_count", "supported_path_length_px",
+            "diagnostic_status",
+        ),
+    )
     if capture_frames:
         sheet = np.vstack([np.hstack(capture_frames[i:i+3]) for i in range(0, len(capture_frames)-2, 3)])
         cv2.imwrite(str(output_dir / "preview_contact_sheet.jpg"), sheet)
@@ -314,11 +1157,64 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             events.write(json.dumps(event) + "\n")
     (output_dir / "config_resolved.yaml").write_text(
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+    provenance = {
+        "schema": PROVENANCE_SCHEMA,
+        "run_id": run_id,
+        "input": {
+            "path": str(input_path),
+            "sha256": input_hash,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "source_frame_count": source_frame_count,
+        },
+        "clip": {
+            "start_seconds": start_seconds,
+            "duration_seconds": duration_seconds,
+            "start_frame": start_frame,
+            "end_frame_exclusive": end_frame,
+            "first_processed_frame": frame_ids[0],
+            "last_processed_frame": frame_ids[-1],
+            "first_event_time_s": timings[0]["event_time_s"],
+            "last_event_time_s": timings[-1]["event_time_s"],
+            "timestamp_policy": "source PTS, fallback frame_id/fps",
+        },
+        "model": {"sha256": model_hash, "path": str(model_path) if model_path else None},
+        "engine": engine,
+        "replay_cache": str(replay_cache) if replay_cache else None,
+        "cache_key": key,
+        "cache_key_match": cache_key_match,
+        "cache_key_override": bool(allow_cache_key_mismatch) if replay_cache is not None else False,
+        "config_hash": config_hash,
+        "scheduler_fingerprint": scheduler_hash,
+        "scheduler_decision_trace_hash": scheduler_trace_hash,
+        "code_fingerprint": code_hash,
+        "motion_roi_enabled": motion_enabled,
+        "motion_roi_shadow_mode": bool(getattr(motion_config, "shadow_mode", False)),
+        "versions": _package_versions(),
+        "runtime": {"python_executable": sys.executable, "platform": platform.platform()},
+        "diagnostic_sampling": {
+            "max_decisions": diagnostic_limit,
+            "stride_frames": diagnostic_stride,
+            "region_definition": "equal_height_diagnostic_band",
+            "regions": list(DIAGNOSTIC_REGIONS),
+        },
+        "limitations": [
+            "Tensor shapes and padding are unavailable unless detector instrumentation is enabled",
+            "Track observation age/deadline is unavailable from the current batch tracker contract",
+            "Common Path trace is bounded by engine diagnostics and may expose aggregate rather than per-segment support",
+        ],
+    }
+    (output_dir / "provenance.json").write_text(
+        json.dumps(provenance, indent=2, ensure_ascii=True), encoding="utf-8"
+    )
     elapsed = time.perf_counter() - began
     def p50(field: str) -> float:
-        return round(float(np.percentile([t[field] for t in timings], 50)), 3)
+        values = [t[field] for t in timings if t.get(field) is not None]
+        return round(float(np.percentile(values, 50)), 3) if values else 0.0
     def p95(field: str) -> float:
-        return round(float(np.percentile([t[field] for t in timings], 95)), 3)
+        values = [t[field] for t in timings if t.get(field) is not None]
+        return round(float(np.percentile(values, 95)), 3) if values else 0.0
     switch_count = sum(event["event"] == "switch" for event in path_events)
     media_duration = max(last_time - start_seconds, 1e-9)
     final_snapshot = legacy_snapshot if selected == "legacy" else latest_snapshot
@@ -337,11 +1233,21 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    support_cap_drops=grid.overflow if grid is not None else 0,
                    rejected_jump_segments=grid.rejected_jumps if grid is not None else 0,
                    analytics_p50_ms=p50("analytics_ms"), analytics_p95_ms=p95("analytics_ms"),
+                   common_path_compute_p50_ms=p50("common_path_compute_ms"),
+                   common_path_compute_p95_ms=p95("common_path_compute_ms"),
                    decode_p50_ms=p50("decode_ms"), decode_p95_ms=p95("decode_ms"),
+                   detector_model_p50_ms=p50("model_predict_ms"),
+                   detector_model_p95_ms=p95("model_predict_ms"),
+                   detector_postprocess_p50_ms=p50("postprocess_ms"),
+                   detector_postprocess_p95_ms=p95("postprocess_ms"),
+                   detector_merge_p50_ms=p50("merge_ms"),
+                   detector_merge_p95_ms=p95("merge_ms"),
                    inference_p50_ms=p50("inference_ms"), inference_p95_ms=p95("inference_ms"),
                    tracking_p50_ms=p50("tracking_ms"), tracking_p95_ms=p95("tracking_ms"),
                    render_p50_ms=p50("render_ms"), render_p95_ms=p95("render_ms"),
                    encode_p50_ms=p50("encode_ms"), encode_p95_ms=p95("encode_ms"),
+                   cache_write_p50_ms=p50("cache_write_ms"),
+                   cache_write_p95_ms=p95("cache_write_ms"),
                    directional_analytics_p95_ms=p95("directional_analytics_ms"),
                    legacy_analytics_p95_ms=p95("legacy_analytics_ms"),
                    path_switches=switch_count,
@@ -351,6 +1257,20 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    polyline_jitter_px=None,
                    change_detection_delay_s=None,
                    processing_fps=round(len(frame_ids)/elapsed, 3),
+                   provenance_schema=PROVENANCE_SCHEMA,
+                   config_hash=config_hash,
+                   scheduler_fingerprint=scheduler_hash,
+                   scheduler_decision_trace_hash=scheduler_trace_hash,
+                   cache_key_match=cache_key_match,
+                   cache_key_override=(bool(allow_cache_key_mismatch) if replay_cache is not None else False),
+                   diagnostics={
+                       "scheduler_decisions": len(scheduler_decisions),
+                       "candidate_decisions": len(candidate_decisions),
+                       "path_support_rows": len(path_support_rows),
+                       "coverage_rows": len(coverage_rows),
+                       "region_funnel_rows": len(region_funnel_rows),
+                       "diagnostic_stride_frames": diagnostic_stride,
+                   },
                    ram_peak_mb=round(max(ram_samples_mb), 2),
                    vram_allocated_peak_mb=(round(cuda_runtime.cuda.max_memory_allocated()/1024**2, 2)
                                            if cuda_runtime else None),
@@ -368,8 +1288,16 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     )
     manifest = dict(run_id=run_id, status="success", **{k: summary[k] for k in
                      ("run_type", "engine", "device", "frames")},
-                    input_hash=input_hash, model_hash=model_hash, cache_key=key,
-                    cache_file=cache_path.name if replay_cache is None else str(replay_cache),
+                     input_hash=input_hash, model_hash=model_hash, cache_key=key,
+                     cache_schema=CACHE_SCHEMA,
+                     provenance_schema=PROVENANCE_SCHEMA,
+                     config_hash=config_hash,
+                     scheduler_fingerprint=scheduler_hash,
+                     scheduler_decision_trace_hash=scheduler_trace_hash,
+                     code_fingerprint=code_hash,
+                     motion_roi_enabled=motion_enabled,
+                     motion_roi_shadow_mode=bool(getattr(motion_config, "shadow_mode", False)),
+                     cache_file=cache_path.name if replay_cache is None else str(replay_cache),
                     rebuilt_cache_file=(rebuilt_cache_path.name if rebuilt_cache_path else None),
                     clip=dict(start_seconds=start_seconds, duration_seconds=duration_seconds),
                     artifacts=sorted(p.name for p in output_dir.iterdir()))
@@ -393,12 +1321,15 @@ def main() -> None:
     parser.add_argument("--model-hash")
     parser.add_argument("--rebuild-tracks", action="store_true",
                         help="Re-run ByteTrack from cached detections without inference")
+    parser.add_argument("--allow-cache-key-mismatch", action="store_true",
+                        help="Audit-only: allow an old cache key when source/model hashes match")
     args = parser.parse_args()
     print(json.dumps(run(args.input, args.output_dir, config_path=args.config, model_path=args.model,
                          start_seconds=args.start_seconds, duration_seconds=args.duration_seconds,
                          run_id=args.run_id, engine=args.engine, replay_cache=args.replay_cache,
                          input_hash=args.source_hash, model_hash=args.model_hash,
-                         rebuild_tracks=args.rebuild_tracks)))
+                         rebuild_tracks=args.rebuild_tracks,
+                         allow_cache_key_mismatch=args.allow_cache_key_mismatch)))
 
 
 if __name__ == "__main__":
