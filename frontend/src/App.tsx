@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { CheckCircle2, CircleAlert, Radio, Server, X } from "lucide-react";
 
-import { getRuntimeInfo, getVisualization, patchVisualization } from "./api";
+import { getRuntimeInfo, getVisualization, patchCommonPathConfig, patchVisualization } from "./api";
 import { FlowField } from "./components/FlowField";
 import { HeatmapPanel } from "./components/HeatmapPanel";
 import { MetricStrip } from "./components/MetricStrip";
@@ -61,6 +61,8 @@ export default function App() {
   const [editor, setEditor] = useState<"calibration" | "zones" | null>(null);
   const [notice, setNotice] = useState("");
   const [runtime, setRuntime] = useState<RuntimeInfo>(DEFAULT_RUNTIME);
+  const [localMaxPaths, setLocalMaxPaths] = useState(1);
+  const [localAppliedMaxPaths, setLocalAppliedMaxPaths] = useState(1);
 
   const status = modalMode ? modalLive.status : data.session?.status ?? "idle";
   const hasConfirmedCommonPath = data.common_paths.some((path) => path.state === "active" || path.state === "cooling");
@@ -95,7 +97,12 @@ export default function App() {
       });
     getRuntimeInfo()
       .then((info) => {
-        if (active) setRuntime(info);
+        if (active) {
+          setRuntime(info);
+          const configured = info.default_max_paths ?? 1;
+          setLocalMaxPaths(configured);
+          setLocalAppliedMaxPaths(configured);
+        }
       })
       .catch((cause) => {
         if (active) {
@@ -139,6 +146,18 @@ export default function App() {
     } catch (cause) {
       setOverlay(previous);
       setNotice(cause instanceof Error ? cause.message : "Unable to update overlays");
+    }
+  }
+
+  async function changeLocalMaxPaths(value: number) {
+    const previous = localMaxPaths;
+    setLocalMaxPaths(value);
+    try {
+      const result = await patchCommonPathConfig(value);
+      setLocalAppliedMaxPaths(result.applied_max_paths);
+    } catch (cause) {
+      setLocalMaxPaths(previous);
+      setNotice(cause instanceof Error ? cause.message : "Unable to update Common Path limit");
     }
   }
 
@@ -228,9 +247,9 @@ export default function App() {
             runtime={runtime}
             commonPathOnly={commonPathOnly}
             modalMetadata={modalLive.metadata}
-            maxPaths={modalMode ? modalLive.maxPaths : undefined}
-            appliedMaxPaths={modalLive.appliedMaxPaths}
-            onMaxPathsChange={modalLive.changeMaxPaths}
+            maxPaths={modalMode ? modalLive.maxPaths : localMaxPaths}
+            appliedMaxPaths={modalMode ? modalLive.appliedMaxPaths : localAppliedMaxPaths}
+            onMaxPathsChange={modalMode ? modalLive.changeMaxPaths : changeLocalMaxPaths}
           />
 
           {!commonPathOnly && (

@@ -25,7 +25,13 @@ from backend.app.inference import PersonDetector, UltralyticsPersonDetector
 from backend.app.metrics import PerformanceMonitor
 from backend.app.schemas import FrameResult, TrackPoint
 from backend.app.tracking import ByteTrackTracker
-from backend.app.video import FrameRenderer, OpenCVVideoSource, OverlayOptions, TrackingPipeline
+from backend.app.video import (
+    FrameRenderer,
+    MotionROIPlanner,
+    OpenCVVideoSource,
+    OverlayOptions,
+    TrackingPipeline,
+)
 from backend.app.video.latest_queue import BoundedFrameQueue
 
 LOGGER = logging.getLogger(__name__)
@@ -82,6 +88,11 @@ class ProcessingSession:
         self.visualization = visualization or config.visualization
         self.renderer = FrameRenderer(self.visualization)
         self.monitor = PerformanceMonitor()
+        self.motion_scheduler = (
+            MotionROIPlanner(config.motion_roi)
+            if config.motion_roi.enabled or config.motion_roi.shadow_mode
+            else None
+        )
         self._overlay = OverlayOptions.from_visualization(self.visualization)
         self._analytics_queue: BoundedFrameQueue[FrameResult | object] = BoundedFrameQueue(
             maxsize=config.video.analytics_queue_size,
@@ -97,6 +108,7 @@ class ProcessingSession:
             reconnect=realtime and source_kind == "rtsp",
             reconnect_initial_seconds=config.video.reconnect_initial_seconds,
             reconnect_max_seconds=config.video.reconnect_max_seconds,
+            motion_scheduler=self.motion_scheduler,
             on_result=self._enqueue_result,
         )
         self._stop = threading.Event()
@@ -110,6 +122,10 @@ class ProcessingSession:
         self._frame_version = 0
         self._latest_frame_id = -1
         self._latest_media_timestamp_s = 0.0
+        # Incremented whenever analytics state is replaced.  An analytics
+        # worker may finish an old frame after a config/ROI update; its output
+        # must not overwrite the newer state or rendered frame.
+        self._analytics_generation = 0
 
     def start(self) -> None:
         with self._state_lock:
@@ -158,6 +174,10 @@ class ProcessingSession:
         with self._state_lock:
             self._overlay = options
 
+    def set_max_paths(self, value: int) -> int:
+        with self._state_lock:
+            return self.analytics.set_max_paths(value)
+
     def current_points(self) -> tuple[TrackPoint, ...]:
         with self._state_lock:
             return self._latest_points
@@ -174,6 +194,7 @@ class ProcessingSession:
         config_data["zones"] = []
         analytics_config = AnalyticsConfig.model_validate(config_data)
         with self._state_lock:
+            self._analytics_generation += 1
             self.analytics = AnalyticsEngine(
                 analytics_config,
                 transformer,
@@ -184,6 +205,7 @@ class ProcessingSession:
 
     def set_zones(self, zones: list[ZoneConfig], *, camera_coordinates: bool = True) -> None:
         with self._state_lock:
+            self._analytics_generation += 1
             transformer = self.analytics.transformer
             if camera_coordinates:
                 zones = [
@@ -232,6 +254,13 @@ class ProcessingSession:
             analytics_dropped_frames=self._analytics_queue.dropped,
         )
         metrics["frame_queue_size"] = metrics["capture_queue_size"]
+        metrics.update({
+            "motion_roi_enabled": bool(self.motion_scheduler is not None),
+            "motion_roi_reference_scans": self.pipeline.stats.reference_scans,
+            "motion_roi_tile_scans": self.pipeline.stats.roi_scans,
+            "motion_roi_intentionally_skipped": self.pipeline.stats.intentionally_skipped_scans,
+            "motion_roi_detector_images": self.pipeline.stats.detector_images,
+        })
         metrics.update(self.analytics.common_path_metrics())
         return metrics
 
@@ -280,6 +309,7 @@ class ProcessingSession:
                 with self._state_lock:
                     engine = self.analytics
                     overlay = self._overlay
+                    generation = self._analytics_generation
                 started = time.perf_counter()
                 trajectories = engine.process_frame(item)
                 current_points = tuple(
@@ -326,6 +356,10 @@ class ProcessingSession:
                     encoding_ms=encoding_ms,
                 )
                 with self._state_lock:
+                    if generation != self._analytics_generation:
+                        # A newer configuration/session state owns the output.
+                        # Keep processing monotonic and avoid stale overwrite.
+                        continue
                     self._latest_jpeg = encoded.tobytes()
                     self._latest_points = current_points
                     self._frame_version += 1
@@ -373,6 +407,7 @@ class SessionManager:
         self._calibration: tuple[list[tuple[float, float]], float, float] | None = None
         self._zones: list[ZoneConfig] = []
         self._visualization = config.visualization.model_copy(deep=True)
+        self._max_paths = config.analytics.common_path.max_paths
         self._lock = threading.RLock()
 
     @property
@@ -408,7 +443,7 @@ class SessionManager:
                 source_kind=source_kind,
                 realtime=realtime,
                 detector=self._detector,
-                config=self.config,
+                config=self.config.model_copy(deep=True),
                 visualization=self._visualization,
                 max_frames=max_frames,
             )
@@ -438,8 +473,20 @@ class SessionManager:
             "cache_reads": None,
             "common_path_only": not self.config.analytics.auxiliary_analytics_enabled,
             "common_path_engine": self.config.analytics.common_path.engine,
-            "default_max_paths": self.config.analytics.common_path.max_paths,
+            "default_max_paths": self._max_paths,
         }
+
+    def set_max_paths(self, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+            raise ValueError("max_paths must be an integer in [1, 5]")
+        with self._lock:
+            self._max_paths = value
+            analytics = self.config.analytics.model_copy(deep=True)
+            analytics.common_path.max_paths = value
+            self.config = self.config.model_copy(update={"analytics": analytics})
+            if self._session is not None:
+                return self._session.set_max_paths(value)
+            return value
 
     def update_visualization(self, changes: dict[str, bool]) -> VisualizationConfig:
         with self._lock:

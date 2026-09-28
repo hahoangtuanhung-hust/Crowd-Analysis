@@ -1,0 +1,7 @@
+# Shadow audit: compute the same proposed ROI schedule as the C profile while
+# executing the full reference detector on every source frame.
+extends: shibuya-motion-roi.yaml
+
+motion_roi:
+  enabled: true
+  shadow_mode: true

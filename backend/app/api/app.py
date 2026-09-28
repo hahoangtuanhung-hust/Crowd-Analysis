@@ -61,6 +61,10 @@ class VisualizationPatchRequest(RequestModel):
     show_metrics: bool | None = None
 
 
+class CommonPathConfigRequest(RequestModel):
+    max_paths: int = Field(ge=1, le=5)
+
+
 class CalibrationRequest(RequestModel):
     points: list[tuple[float, float]] = Field(min_length=4, max_length=4)
     width: float = Field(gt=0)
@@ -262,6 +266,22 @@ def create_app(
             if value is not None
         }
         return session_manager.update_visualization(changes).model_dump()
+
+    @app.get("/api/config/common-path")
+    def common_path_config() -> dict[str, int]:
+        return {"max_paths": int(session_manager.runtime_info()["default_max_paths"])}
+
+    @app.patch("/api/config/common-path")
+    def patch_common_path(request: CommonPathConfigRequest) -> dict[str, int | bool]:
+        try:
+            applied = session_manager.set_max_paths(request.max_paths)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "accepted_max_paths": request.max_paths,
+            "applied_max_paths": applied,
+            "state_preserved": True,
+        }
 
     @app.post("/api/calibration")
     def update_calibration(request: CalibrationRequest) -> dict:

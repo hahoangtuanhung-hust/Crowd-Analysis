@@ -179,3 +179,18 @@ def test_upload_rejects_non_video_extension(tmp_path: Path) -> None:
             files={"video": ("notes.txt", b"not a video", "text/plain")},
         )
     assert response.status_code == 415
+
+
+def test_common_path_limit_is_hot_configurable_without_session_reset() -> None:
+    config = AppConfig()
+    app = create_app(config, SessionManager(config, detector_factory=MovingDetector))
+    with TestClient(app) as client:
+        assert client.get("/api/config/common-path").json()["max_paths"] == 1
+        response = client.patch("/api/config/common-path", json={"max_paths": 3})
+        assert response.status_code == 200
+        assert response.json() == {
+            "accepted_max_paths": 3,
+            "applied_max_paths": 3,
+            "state_preserved": True,
+        }
+        assert client.get("/api/runtime").json()["default_max_paths"] == 3

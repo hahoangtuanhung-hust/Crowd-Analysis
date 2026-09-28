@@ -56,6 +56,14 @@ export function patchVisualization(
   });
 }
 
+export function patchCommonPathConfig(maxPaths: number): Promise<{ accepted_max_paths: number; applied_max_paths: number; state_preserved: boolean }> {
+  return request("/api/config/common-path", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ max_paths: maxPaths })
+  });
+}
+
 export function getGrandCentralResult(source: DatasetSource, coordinateMode: CoordinateMode, duration: DatasetDuration): Promise<DatasetAnalyticsResult> {
   const params = new URLSearchParams({ source, coordinate_mode: coordinateMode, duration });
   return request(`/api/datasets/grand-central/results?${params}`);

@@ -11,12 +11,16 @@ __all__ = [
     "OverlayOptions",
     "PipelineStats",
     "TrackingPipeline",
+    "MotionROIPlan",
+    "MotionROIPlanner",
     "VideoMetadata",
 ]
 
 _EXPORT_MODULES = {
     "PipelineStats": ".pipeline",
     "TrackingPipeline": ".pipeline",
+    "MotionROIPlan": ".motion_roi",
+    "MotionROIPlanner": ".motion_roi",
     "FrameRenderer": ".renderer",
     "OverlayOptions": ".renderer",
     "OpenCVVideoSource": ".source",

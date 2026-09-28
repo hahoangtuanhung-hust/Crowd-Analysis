@@ -1,0 +1,46 @@
+# Experimental C profile.  The base profile keeps detector/tracker/Common Path
+# parity with configs/shibuya.yaml; only the feature flag and scheduler knobs
+# differ.  Production remains disabled unless this file is selected explicitly.
+extends: shibuya.yaml
+
+motion_roi:
+  enabled: true
+  shadow_mode: false
+  background:
+    method: mog2
+    analysis_width: 640
+    warmup_min_s: 2.0
+    warmup_max_s: 6.0
+    learning_time_constant_s: 10.0
+    detect_shadows: true
+    static_confirm_s: 2.0
+    max_mask_age_s: 0.15
+    foreground_ratio_max: 0.70
+    min_component_area_ratio: 0.00001
+  coverage:
+    periodic_scan_interval_s: 0.5
+    use_validated_reference_profile: true
+    minimum_sample_count: 3
+  roi:
+    reuse_existing_tiles_first: true
+    max_selected_tiles: 2
+    bbox_padding_ratio: 0.15
+    protect_track_predictions: true
+    prioritize_observation_deadlines: true
+    max_roi_union_ratio: 0.70
+  tracking:
+    max_observation_gap_s: 1.0
+    prediction_grace_s: 1.5
+    distinguish_not_searched_from_missed: true
+  fallback:
+    enabled: true
+    use_measured_cost_guard: true
+    area_ratio_enter: 0.70
+    area_ratio_exit: 0.50
+    soft_recovery_confirm_s: 1.0
+    max_recovery_s: 4.0
+  diagnostics:
+    log_scheduler_decisions: true
+    log_coverage_by_region: true
+    debug_overlay: true
+    max_decisions: 10000
