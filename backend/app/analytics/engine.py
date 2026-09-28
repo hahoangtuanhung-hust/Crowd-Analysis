@@ -253,6 +253,15 @@ class AnalyticsEngine:
                 return self.ddcrp.snapshot()
             return self.common_path.snapshot() if self.common_path is not None else CommonPathSnapshot(0, ())
 
+    def set_max_paths(self, value: int) -> int:
+        """Change only the displayed Common Path limit without resetting state."""
+        with self._lock:
+            if self.config.common_path.engine != "tracklet_aggregation":
+                raise ValueError("max_paths hot update requires tracklet_aggregation")
+            applied = self.tracklet_path.set_max_paths(value)
+            self.config.common_path.max_paths = applied
+            return applied
+
     def common_path_flows(self) -> DirectedFlowSnapshot:
         with self._lock:
             if self.config.common_path.engine == "tracklet_aggregation":
@@ -276,6 +285,10 @@ class AnalyticsEngine:
                     "common_path_compute_ms_p95": round(float(np.percentile(compute_ms, 95)), 3) if compute_ms else None,
                     "tracklet_segments": self.tracklet_path.buffered_segment_count,
                     "tracklet_rejections": sum(self.tracklet_path.rejections.values()),
+                    "tracklet_new_segments_last_compute": self.tracklet_path.last_compute_new_segments,
+                    "tracklet_duplicate_or_late_points": self.tracklet_path.rejections.get(
+                        "DUPLICATE_OR_LATE_POINT", 0
+                    ),
                 }
             if self.config.common_path.engine == "directional_grid":
                 return {"directional_tracks": len(self.directional_path._tracks),

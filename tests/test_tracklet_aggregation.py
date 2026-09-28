@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 from backend.app.analytics.directional_grid import GridTrackPoint
 from backend.app.analytics.spatial import SpatialTransformer
 from backend.app.analytics.tracklet_aggregation import TrackletAggregationEngine
@@ -36,6 +38,41 @@ def test_curved_overlap_deduplicates_tracks_and_keeps_id_on_k_change():
     assert analyzer.set_max_paths(5) == 5
     assert analyzer.snapshot().paths[0].path_id == path.path_id
     assert analyzer.snapshot().paths[0].color == path.color
+
+
+def test_common_path_is_a_dense_piecewise_linear_polyline():
+    analyzer = engine(segment_length_fraction=0.02)
+    route = [(80 + i * 70, 260 + i * i * 3) for i in range(12)]
+    paths = feed(analyzer, {1: route, 2: route, 3: route})
+
+    assert len(paths) == 1
+    polyline = np.asarray(paths[0].polyline, dtype=np.float64) / 1000.0
+    lengths = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
+    assert len(polyline) > 20
+    assert np.all(lengths > 0)
+    assert float(lengths.max()) <= 0.025
+    # A turn must remain represented by multiple local vectors, not an
+    # endpoint-only line.
+    local_cosines = np.sum(
+        (polyline[1:-1] - polyline[:-2]) * (polyline[2:] - polyline[1:-1]), axis=1
+    )
+    assert np.any(local_cosines < 0.001)
+
+
+def test_scale_aware_displacement_keeps_small_far_field_motion():
+    analyzer = engine(
+        min_support_tracks=2,
+        min_displacement_fraction=0.018,
+        min_track_duration_seconds=0.3,
+    )
+    # The total displacement is below the global 1.8% floor but is valid for
+    # a person far from the camera (top of the normalized image).
+    route = [(100 + i * 4, 20 + i) for i in range(4)]
+    paths = feed(analyzer, {1: route, 2: route}, count=4)
+
+    assert len(paths) == 1
+    assert paths[0].support_tracks == 2
+    assert analyzer.rejections["VALID_TRACKLETS"] >= 2
 
 
 def test_crossing_and_reverse_not_joined():
@@ -176,3 +213,111 @@ def test_identity_merge_extends_camera_entry_route_to_new_exit_segment():
 
     assert merged[0][0] < 130.0
     assert merged[-1][0] > 850.0
+
+
+def test_different_people_on_same_route_link_across_long_time_gap():
+    analyzer = engine(
+        min_support_tracks=2,
+        min_track_duration_seconds=0.3,
+        max_link_gap_seconds=0.5,
+        evidence_window_seconds=20.0,
+    )
+    route = [(100 + index * 80, 260) for index in range(5)]
+
+    for offset, point in enumerate(route):
+        analyzer.update([
+            GridTrackPoint("cam", "epoch", 1, 0, offset, offset * 0.2, *point)
+        ], offset * 0.2)
+    for offset, point in enumerate(route, start=25):
+        timestamp = offset * 0.2
+        analyzer.update([
+            GridTrackPoint("cam", "epoch", 2, 0, offset, timestamp, *point)
+        ], timestamp)
+
+    paths = analyzer.finalize().paths
+
+    assert len(paths) == 1
+    assert paths[0].support_tracks == 2
+
+
+def test_same_track_fragments_remain_time_gated_and_diagnostics_explain_support():
+    analyzer = engine(
+        min_support_tracks=2,
+        min_track_duration_seconds=0.3,
+        max_observation_gap_seconds=0.5,
+        max_link_gap_seconds=0.5,
+        evidence_window_seconds=20.0,
+    )
+    route = [(100 + index * 80, 260) for index in range(5)]
+
+    for offset, point in enumerate(route):
+        analyzer.update([
+            GridTrackPoint("cam", "epoch", 1, 0, offset, offset * 0.2, *point)
+        ], offset * 0.2)
+    for offset, point in enumerate(route, start=25):
+        timestamp = offset * 0.2
+        analyzer.update([
+            GridTrackPoint("cam", "epoch", 1, 1, offset, timestamp, *point)
+        ], timestamp)
+
+    assert analyzer.finalize().paths == ()
+    decisions = analyzer.diagnostics()["candidate_decisions"]
+    assert decisions
+    assert all(item["decision_reason"] == "INSUFFICIENT_SUPPORT_IDS" for item in decisions[-2:])
+
+
+def test_candidate_and_selected_path_support_diagnostics_are_bounded_and_explicit():
+    analyzer = engine(min_support_tracks=2)
+    route = [(100 + index * 60, 220) for index in range(10)]
+
+    paths = feed(analyzer, {1: route, 2: route})
+
+    assert len(paths) == 1
+    diagnostics = analyzer.diagnostics()
+    selected = [
+        item for item in diagnostics["candidate_decisions"]
+        if item["decision_reason"] == "SELECTED_CANDIDATE_POOL"
+    ]
+    assert selected
+    assert selected[-1]["score_components"]["support_tracks"] == 2
+    assert 0.0 <= selected[-1]["evidence_coverage"] <= 1.0
+    assert diagnostics["path_support"][-1]["path_id"] == paths[0].path_id
+    assert diagnostics["path_support"][-1]["support_unit"] == "temporary_track_id"
+
+
+def test_duplicate_points_do_not_inflate_segment_or_support():
+    analyzer = engine()
+    point = GridTrackPoint("cam", "epoch", 1, 7, 0, 0.0, 100, 200)
+    analyzer.update([point], 0.0)
+    analyzer.update([point], 0.1)
+    assert analyzer.rejections["DUPLICATE_OR_LATE_POINT"] == 1
+    assert analyzer.buffered_segment_count == 1
+    assert len(analyzer._segments[('cam', 'epoch', 1)].points) == 1
+
+
+def test_segment_id_change_closes_generation_without_reusing_old_points():
+    analyzer = engine()
+    for frame, segment_id in ((0, 1), (1, 1), (2, 2), (3, 2)):
+        analyzer.update([
+            GridTrackPoint("cam", "epoch", 1, segment_id, frame, frame * 0.2,
+                           100 + frame * 30, 200)
+        ], frame * 0.2)
+    assert len(analyzer._closed) == 1
+    assert analyzer._segments[('cam', 'epoch', 1)].segment_id == 2
+    assert analyzer._segments[('cam', 'epoch', 1)].number == 2
+
+
+def test_second_compute_reuses_unchanged_segment_signature():
+    analyzer = engine()
+    route = [(100 + index * 70, 220) for index in range(8)]
+    for frame, point in enumerate(route[:5]):
+        analyzer.update([
+            GridTrackPoint("cam", "epoch", 1, 0, frame, frame * 0.2, *point)
+        ], frame * 0.2)
+    # The update interval already computed the active signature. A later
+    # compute without a new point should reuse it.
+    analyzer.finalize(2.0)
+    first_count = analyzer.last_compute_new_segments
+    analyzer.finalize(2.1)
+    assert first_count == 0
+    assert analyzer.last_compute_new_segments == 0

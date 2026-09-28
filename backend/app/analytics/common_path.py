@@ -129,6 +129,7 @@ class CommonPathAnalyzer:
         self._cooling_paths: list[_CoolingPath] = []
         self._retired_once: list[CommonPath] = []
         self._snapshot = CommonPathSnapshot(timestamp=0.0, paths=())
+        self._snapshot_version = 0
         self._flow_snapshot = DirectedFlowSnapshot(
             from_timestamp=0.0,
             to_timestamp=0.0,
@@ -556,7 +557,17 @@ class CommonPathAnalyzer:
         started = time.perf_counter()
         candidates = self._extract_candidates(timestamp)
         paths = self._update_states(candidates, timestamp)
-        self._snapshot = CommonPathSnapshot(timestamp=timestamp, paths=paths)
+        # Snapshot versions are monotonic within a session.  Consumers can
+        # safely discard an older worker result without comparing wall clocks.
+        self._snapshot_version += 1
+        self._snapshot = CommonPathSnapshot(
+            timestamp=timestamp,
+            paths=paths,
+            version=self._snapshot_version,
+            evidence_until_s=max(
+                (path.evidence_until_s for path in paths), default=timestamp
+            ),
+        )
         self._last_compute_at = timestamp
         self._compute_ms.append((time.perf_counter() - started) * 1000.0)
         for path in paths:

@@ -14,6 +14,7 @@ import statistics
 import time
 from collections import Counter, deque
 from collections.abc import Iterable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from itertools import chain
 
@@ -45,6 +46,7 @@ class TrackletPoint:
 class _Segment:
     key: TrackKey
     number: int
+    segment_id: int
     points: deque[tuple[float, float, float]]
     last_frame: int
 
@@ -84,28 +86,46 @@ class TrackletAggregationEngine:
         self._segments: dict[TrackKey, _Segment] = {}
         self._closed: deque[_Segment] = deque()
         self._number: Counter[TrackKey] = Counter()
+        self._last_ingested: dict[tuple[TrackKey, int], tuple[int, float]] = {}
+        self._tracklet_cache: dict[tuple[object, ...], _Tracklet | None] = {}
+        self._link_score_cache: dict[tuple[object, ...], float] = {}
+        self.link_score_cache_hits = 0
+        self._last_compute_new_segments = 0
         self._identities: dict[str, _Identity] = {}
         self._sequence = 0
         self._last_time = -math.inf
         self._last_compute = -math.inf
         self._snapshot = CommonPathSnapshot(0, ())
         self.events: list[dict] = []
+        # Bounded evidence buffers for offline diagnostics/export.  Keep them
+        # separate from the compact product snapshot and return copies below.
+        self._candidate_diagnostics: deque[dict[str, object]] = deque(maxlen=512)
+        self._path_support_diagnostics: deque[dict[str, object]] = deque(maxlen=512)
         self.rejections: Counter[str] = Counter()
         self.compute_ms: deque[float] = deque(maxlen=256)
         self.candidate_count = 0
+        self.candidate_pool_count = 0
 
     def reset(self) -> None:
         self._segments.clear()
         self._closed.clear()
         self._number.clear()
+        self._last_ingested.clear()
+        self._tracklet_cache.clear()
+        self._link_score_cache.clear()
+        self.link_score_cache_hits = 0
+        self._last_compute_new_segments = 0
         self._identities.clear()
         self._snapshot = CommonPathSnapshot(0, ())
         self._last_compute = -math.inf
         self._last_time = -math.inf
         self.events.clear()
+        self._candidate_diagnostics.clear()
+        self._path_support_diagnostics.clear()
         self.rejections.clear()
         self.compute_ms.clear()
         self.candidate_count = 0
+        self.candidate_pool_count = 0
 
     def set_max_paths(self, value: int) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
@@ -116,6 +136,26 @@ class TrackletAggregationEngine:
 
     def snapshot(self) -> CommonPathSnapshot:
         return self._snapshot
+
+    @property
+    def candidate_decisions(self) -> tuple[dict[str, object], ...]:
+        """Bounded candidate funnel for diagnostics/export."""
+        return tuple(deepcopy(item) for item in self._candidate_diagnostics)
+
+    @property
+    def path_support_diagnostics(self) -> tuple[dict[str, object], ...]:
+        """Bounded selected-path support history for diagnostics/export."""
+        return tuple(deepcopy(item) for item in self._path_support_diagnostics)
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return Common Path evidence without exposing mutable internals."""
+        return {
+            "candidate_pool_count": self.candidate_pool_count,
+            "candidate_count": self.candidate_count,
+            "candidate_decisions": self.candidate_decisions,
+            "path_support": self.path_support_diagnostics,
+            "rejections": dict(self.rejections),
+        }
 
     def finalize(self, timestamp: float | None = None) -> CommonPathSnapshot:
         """Evaluate the final active segments without waiting for the interval."""
@@ -134,6 +174,11 @@ class TrackletAggregationEngine:
         """Number of active and closed segments retained by the bounded buffer."""
         return len(self._segments) + len(self._closed)
 
+    @property
+    def last_compute_new_segments(self) -> int:
+        """How many segment signatures required fresh validation last compute."""
+        return self._last_compute_new_segments
+
     def update(self, points: Iterable[TrackletPoint], timestamp: float) -> CommonPathSnapshot:
         points = tuple(points)
         if timestamp < self._last_time or any(
@@ -147,6 +192,14 @@ class TrackletAggregationEngine:
             if not point.observed or not point.confirmed or point.event_time_s > timestamp:
                 continue
             key = point.camera_id, point.stream_epoch, point.track_id
+            watermark_key = (key, int(point.segment_id))
+            previous_ingest = self._last_ingested.get(watermark_key)
+            if previous_ingest is not None and (
+                point.frame_id <= previous_ingest[0]
+                or point.event_time_s <= previous_ingest[1]
+            ):
+                self.rejections["DUPLICATE_OR_LATE_POINT"] += 1
+                continue
             x, y = point.x / self.width, point.y / self.height
             if not (math.isfinite(x) and math.isfinite(y) and -0.01 <= x <= 1.01 and -0.01 <= y <= 1.01):
                 self.rejections["INVALID_POINT"] += 1
@@ -157,7 +210,11 @@ class TrackletAggregationEngine:
                 if point.frame_id <= segment.last_frame or point.event_time_s <= last_s:
                     continue
                 distance = math.hypot(x - last_x, y - last_y)
-                if point.event_time_s - last_s > cfg.max_observation_gap_seconds or distance > cfg.max_step_fraction:
+                if (
+                    point.segment_id != segment.segment_id
+                    or point.event_time_s - last_s > cfg.max_observation_gap_seconds
+                    or distance > cfg.max_step_fraction
+                ):
                     self._closed.append(segment)
                     segment = None
                 elif distance < cfg.min_step_fraction:
@@ -166,12 +223,13 @@ class TrackletAggregationEngine:
             if segment is None:
                 self._number[key] += 1
                 segment = _Segment(
-                    key, self._number[key],
+                    key, self._number[key], int(point.segment_id),
                     deque(maxlen=cfg.max_points_per_track), point.frame_id,
                 )
                 self._segments[key] = segment
             segment.points.append((point.event_time_s, x, y))
             segment.last_frame = point.frame_id
+            self._last_ingested[watermark_key] = (point.frame_id, point.event_time_s)
 
         cutoff = timestamp - cfg.evidence_window_seconds
         for key, segment in list(self._segments.items()):
@@ -192,6 +250,12 @@ class TrackletAggregationEngine:
             stale = sorted(self._segments, key=lambda k: self._segments[k].points[-1][0])
             for key in stale[:len(self._segments) - cfg.max_tracks]:
                 del self._segments[key]
+
+        # Watermarks are bounded by the same evidence horizon as segments.
+        self._last_ingested = {
+            key: value for key, value in self._last_ingested.items()
+            if value[1] >= cutoff
+        }
 
         if timestamp - self._last_compute >= cfg.update_interval_seconds:
             started = time.perf_counter()
@@ -235,6 +299,24 @@ class TrackletAggregationEngine:
             np.interp(samples, cumulative, points[:, 1]),
         ))
 
+    def _resample_by_spacing(self, points: np.ndarray) -> np.ndarray:
+        """Resample an observed route into short straight segments.
+
+        The interpolation is only along the observed piecewise-linear route;
+        no spline or endpoint-only shortcut is introduced.  A bounded point
+        count keeps rendering and identity matching predictable on long clips.
+        """
+        points = self._deduplicate(np.asarray(points, dtype=np.float64))
+        if len(points) < 2:
+            return points.copy()
+        spacing = max(float(self.config.segment_length_fraction), 1e-6)
+        length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+        if length <= 1e-9:
+            return points[:1].copy()
+        count = int(math.ceil(length / spacing)) + 1
+        count = max(2, min(128, count))
+        return self._resample(points, count)
+
     def _sample(self, coordinates: np.ndarray) -> np.ndarray:
         """Compatibility helper used by older diagnostics and notebooks."""
         return self._resample(coordinates)
@@ -259,7 +341,14 @@ class TrackletAggregationEngine:
         lengths = np.linalg.norm(deltas, axis=1)
         arc_length = float(lengths.sum())
         displacement = float(np.linalg.norm(raw[-1] - raw[0]))
-        if displacement < cfg.min_displacement_fraction or arc_length <= 1e-9:
+        # Bottom-centre coordinates carry a perspective scale signal: at the
+        # top of the frame the same world motion occupies fewer pixels.  Use a
+        # continuous image-derived factor instead of hard-coding zones so small
+        # distant people are not discarded by one global displacement floor.
+        mean_y = float(np.mean(raw[:, 1])) if len(raw) else 0.5
+        perspective_scale = max(0.35, min(1.0, 0.35 + 0.65 * mean_y))
+        min_displacement = cfg.min_displacement_fraction * perspective_scale
+        if displacement < min_displacement or arc_length <= 1e-9:
             self.rejections["LOW_DISPLACEMENT"] += 1
             return None
         if arc_length / displacement > cfg.max_path_stretch:
@@ -273,7 +362,7 @@ class TrackletAggregationEngine:
             self.rejections["WRONG_DIRECTION"] += 1
             return None
         points = self._smooth(raw)
-        quality = max(0.0, min(1.0, consistency * min(1.0, displacement / max(cfg.min_displacement_fraction * 3.0, 1e-9))))
+        quality = max(0.0, min(1.0, consistency * min(1.0, displacement / max(min_displacement * 3.0, 1e-9))))
         return _Tracklet(
             segment.key,
             segment.number,
@@ -364,29 +453,69 @@ class TrackletAggregationEngine:
 
     def _link_score(self, first: _Tracklet, second: _Tracklet) -> float:
         cfg = self.config
+        first_fingerprint = (
+            first.key, first.number, round(first.start_time, 6), round(first.end_time, 6),
+            len(first.points), tuple(np.round(first.points[-1], 6)),
+        )
+        second_fingerprint = (
+            second.key, second.number, round(second.start_time, 6), round(second.end_time, 6),
+            len(second.points), tuple(np.round(second.points[-1], 6)),
+        )
+        cache_key = (first_fingerprint, second_fingerprint)
+        cached = self._link_score_cache.get(cache_key)
+        if cached is not None:
+            self.link_score_cache_hits += 1
+            return cached
         direction = self._direction_cos(first.direction, second.direction)
         if direction < math.cos(math.radians(cfg.match_angle_degrees)):
-            return 0.0
+            score = 0.0
+            self._link_score_cache[cache_key] = score
+            return score
         overlap_a, distance_a = self._overlap_stats(first.points, second.points)
         overlap_b, distance_b = self._overlap_stats(second.points, first.points)
         overlap = max(overlap_a, overlap_b)
         mean_distance = min(distance_a, distance_b)
         overlap_time_gap = max(first.start_time, second.start_time) - min(first.end_time, second.end_time)
-        if overlap >= cfg.min_overlap_fraction and overlap_time_gap <= cfg.max_link_gap_seconds:
-            return 1.0 + overlap * 0.7 + direction * 0.25 - mean_distance
+        if overlap >= cfg.min_overlap_fraction:
+            # Different temporary IDs are commonly produced when people enter
+            # the same corridor at different times.  A strong directed
+            # geometric overlap is evidence for one common path even when the
+            # time gap exceeds the short same-track observation gap.  Keep the
+            # strict temporal gate for fragments of the same track ID, where a
+            # long gap is more likely disappearance/ID reuse.
+            same_track = first.key == second.key
+            if not same_track or overlap_time_gap <= cfg.max_link_gap_seconds:
+                temporal_penalty = 0.0
+                if overlap_time_gap > 0.0 and cfg.max_link_gap_seconds > 0.0:
+                    temporal_penalty = min(
+                        0.15,
+                        overlap_time_gap / cfg.max_link_gap_seconds * 0.15,
+                    )
+                score = 1.0 + overlap * 0.7 + direction * 0.25 - mean_distance - temporal_penalty
+                self._link_score_cache[cache_key] = score
+                if len(self._link_score_cache) > self.config.max_matching_tracklets * 256:
+                    self._link_score_cache.pop(next(iter(self._link_score_cache)))
+                return score
 
         before, after = (first, second) if first.end_time <= second.start_time else (second, first)
         gap = after.start_time - before.end_time
         if gap < 0.0 or gap > cfg.max_link_gap_seconds:
-            return 0.0
+            score = 0.0
+            self._link_score_cache[cache_key] = score
+            return score
         predicted = before.points[-1] + before.direction * min(
             before.displacement / max(before.end_time - before.start_time, 1e-6) * gap,
             cfg.max_step_fraction * 2.0,
         )
         endpoint_distance = float(np.linalg.norm(after.points[0] - predicted))
         if endpoint_distance > cfg.match_distance_fraction * 3.0:
-            return 0.0
-        return 0.65 + direction * 0.25 - endpoint_distance / max(cfg.match_distance_fraction * 3.0, 1e-9)
+            score = 0.0
+        else:
+            score = 0.65 + direction * 0.25 - endpoint_distance / max(cfg.match_distance_fraction * 3.0, 1e-9)
+        self._link_score_cache[cache_key] = score
+        if len(self._link_score_cache) > self.config.max_matching_tracklets * 256:
+            self._link_score_cache.pop(next(iter(self._link_score_cache)))
+        return score
 
     def _merge_overlap(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
         """Median-blend compatible samples while retaining the longer route extent."""
@@ -394,7 +523,7 @@ class TrackletAggregationEngine:
             base, other = second, first
         else:
             base, other = first, second
-        route = self._resample(base)
+        route = self._resample_by_spacing(base)
         positions, distances = self._project(other, route)
         bins: list[list[np.ndarray]] = [[] for _ in route]
         for point, position, distance in zip(other, positions, distances):
@@ -409,8 +538,17 @@ class TrackletAggregationEngine:
     def _attach(self, route: np.ndarray, tracklet: _Tracklet) -> tuple[float, np.ndarray]:
         cfg = self.config
         candidate = tracklet.points
-        direction = self._direction_cos(route[-1] - route[0], tracklet.direction)
-        if direction < math.cos(math.radians(cfg.match_angle_degrees)):
+        if len(route) < 2 or len(candidate) < 2:
+            return 0.0, route
+        # A curved common path may change heading substantially from its
+        # origin to its destination. Compare a candidate with the local
+        # tangent at the endpoint being joined, rather than the route's
+        # end-to-end vector. This preserves real turns while still rejecting
+        # opposite-direction segments at intersections.
+        angle_gate = math.cos(math.radians(cfg.match_angle_degrees))
+        append_direction = self._direction_cos(route[-1] - route[-2], tracklet.direction)
+        prepend_direction = self._direction_cos(route[1] - route[0], tracklet.direction)
+        if max(append_direction, prepend_direction) < angle_gate:
             return 0.0, route
         overlap_a, _ = self._overlap_stats(route, candidate)
         overlap_b, _ = self._overlap_stats(candidate, route)
@@ -420,32 +558,81 @@ class TrackletAggregationEngine:
         threshold = cfg.match_distance_fraction * 3.0
         append_distance = float(np.linalg.norm(route[-1] - candidate[0]))
         prepend_distance = float(np.linalg.norm(candidate[-1] - route[0]))
-        if append_distance <= threshold:
+        if append_distance <= threshold and append_direction >= angle_gate:
             bridge = (route[-1] + candidate[0]) / 2.0
             merged = np.vstack((route[:-1], bridge, candidate))
-            return 1.0 - append_distance / threshold, self._smooth(merged)
-        if prepend_distance <= threshold:
+            return 1.0 + append_direction - append_distance / threshold, self._smooth(merged)
+        if prepend_distance <= threshold and prepend_direction >= angle_gate:
             bridge = (candidate[-1] + route[0]) / 2.0
             merged = np.vstack((candidate[:-1], bridge, route))
-            return 1.0 - prepend_distance / threshold, self._smooth(merged)
+            return 1.0 + prepend_direction - prepend_distance / threshold, self._smooth(merged)
         return 0.0, route
 
     def _merge_cluster(self, tracklets: list[_Tracklet]) -> np.ndarray:
-        seed = max(tracklets, key=lambda item: (item.arc_length, len(item.points)))
+        # Pick a representative-quality seed instead of giving the longest or
+        # densest track disproportionate influence over the common route.
+        median_length = statistics.median(item.arc_length for item in tracklets)
+        seed = min(
+            tracklets,
+            key=lambda item: (-item.quality, abs(item.arc_length - median_length), item.start_time, item.key),
+        )
         route = seed.points.copy()
         remaining = [item for item in tracklets if item is not seed]
+        attached = [seed]
         while remaining:
             best_index, best_score, best_route = -1, 0.0, route
             for index, tracklet in enumerate(remaining):
+                # Geometry alone is insufficient at a crossing.  Require a
+                # direct directed overlap or temporally plausible endpoint
+                # transition with at least one already attached observation.
+                evidence = max((self._link_score(tracklet, item) for item in attached), default=0.0)
+                if evidence <= 0.0:
+                    continue
                 score, merged = self._attach(route, tracklet)
                 if score > best_score:
                     best_index, best_score, best_route = index, score, merged
             if best_index < 0:
                 break
             route = best_route
-            remaining.pop(best_index)
-        route = self._smooth(self._deduplicate(route), passes=2)
-        return self._resample(route, min(48, max(8, len(route))))
+            attached.append(remaining.pop(best_index))
+        route = self._smooth(self._deduplicate(route), passes=1)
+        return self._resample_by_spacing(route)
+
+    def _evidence_coverage(self, tracklets: list[_Tracklet], route: np.ndarray) -> float:
+        """Estimate route-bin coverage from observed tracklet geometry.
+
+        This is a diagnostic only.  Bins are marked once across the candidate,
+        so a high-FPS or unusually long track cannot inflate coverage by adding
+        more samples.
+        """
+        if len(route) < 2 or not tracklets:
+            return 0.0
+        bins = np.zeros(32, dtype=bool)
+        tolerance = self.config.match_distance_fraction * 1.5
+        for tracklet in tracklets:
+            positions, distances = self._project(tracklet.points, route)
+            valid = distances <= tolerance
+            if not np.any(valid):
+                continue
+            normalized = np.clip(
+                positions[valid] / max(len(route) - 1, 1), 0.0, 1.0
+            )
+            indices = np.rint(normalized * (len(bins) - 1)).astype(int)
+            bins[indices] = True
+        return float(np.mean(bins))
+
+    def _record_candidate_diagnostic(self, payload: dict[str, object]) -> dict[str, object]:
+        """Append JSON-friendly bounded candidate evidence."""
+        normalized: dict[str, object] = {}
+        for key, value in payload.items():
+            if isinstance(value, np.integer):
+                normalized[key] = int(value)
+            elif isinstance(value, np.floating):
+                normalized[key] = float(value)
+            else:
+                normalized[key] = value
+        self._candidate_diagnostics.append(normalized)
+        return normalized
 
     def _compute(self, timestamp: float) -> None:
         cfg = self.config
@@ -455,16 +642,45 @@ class TrackletAggregationEngine:
             key=lambda item: item.points[-1][0] if item.points else -math.inf,
             reverse=True,
         )[:max(cfg.max_matching_tracklets * 2, cfg.max_matching_tracklets + 256)]
+        new_segments = 0
+        active_signatures: set[tuple[object, ...]] = set()
         for segment in segments:
-            tracklet = self._tracklet_from_segment(segment)
+            if not segment.points:
+                continue
+            first_time, first_x, first_y = segment.points[0]
+            last_time, last_x, last_y = segment.points[-1]
+            signature = (
+                segment.key,
+                segment.number,
+                segment.segment_id,
+                segment.last_frame,
+                len(segment.points),
+                float(first_time),
+                float(first_x),
+                float(first_y),
+                float(last_time),
+                float(last_x),
+                float(last_y),
+            )
+            active_signatures.add(signature)
+            if signature not in self._tracklet_cache:
+                self._tracklet_cache[signature] = self._tracklet_from_segment(segment)
+                new_segments += 1
+            tracklet = self._tracklet_cache[signature]
             if tracklet is not None:
                 tracklets.append(tracklet)
+        self._tracklet_cache = {
+            signature: value for signature, value in self._tracklet_cache.items()
+            if signature in active_signatures
+        }
+        self._last_compute_new_segments = new_segments
         if len(tracklets) > cfg.max_matching_tracklets:
             tracklets.sort(key=lambda item: (item.end_time, item.quality, item.arc_length), reverse=True)
             dropped = len(tracklets) - cfg.max_matching_tracklets
             tracklets = tracklets[:cfg.max_matching_tracklets]
             self.rejections["MATCHING_TRACKLET_CAP"] += dropped
         self.rejections["VALID_TRACKLETS"] = len(tracklets)
+        self.candidate_pool_count = 0
         if not tracklets:
             self.candidate_count = 0
             self._update_identities((), timestamp)
@@ -514,36 +730,96 @@ class TrackletAggregationEngine:
             grouped.setdefault(find(index), []).append(tracklet)
 
         candidates: list[CommonPath] = []
-        for cluster in grouped.values():
+        candidate_diagnostic_by_object: dict[int, dict[str, object]] = {}
+        for cluster_index, cluster in enumerate(grouped.values()):
             support_ids = {item.key[2] for item in cluster}
+            candidate_id = f"candidate-{timestamp:.3f}-{cluster_index:03d}"
             if len(support_ids) < cfg.min_support_tracks:
                 self.rejections["INSUFFICIENT_SUPPORT_IDS"] += 1
+                self._record_candidate_diagnostic({
+                    "candidate_id": candidate_id,
+                    "timestamp": float(timestamp),
+                    "support_tracks": len(support_ids),
+                    "raw_track_ids": sorted(int(track_id) for track_id in support_ids),
+                    "segment_count": len(cluster),
+                    "decision_reason": "INSUFFICIENT_SUPPORT_IDS",
+                })
                 continue
             polyline = self._merge_cluster(cluster)
             if len(polyline) < 2:
                 self.rejections["EMPTY_MERGE"] += 1
+                self._record_candidate_diagnostic({
+                    "candidate_id": candidate_id,
+                    "timestamp": float(timestamp),
+                    "support_tracks": len(support_ids),
+                    "raw_track_ids": sorted(int(track_id) for track_id in support_ids),
+                    "segment_count": len(cluster),
+                    "decision_reason": "EMPTY_MERGE",
+                })
                 continue
             quality = float(statistics.mean(item.quality for item in cluster))
             temporal_coverage = min(1.0, len(cluster) / max(cfg.min_support_tracks, 1))
-            score = len(support_ids) * (0.55 + 0.45 * temporal_coverage) * (0.5 + 0.5 * quality)
+            evidence_coverage = self._evidence_coverage(cluster, polyline)
+            # Support is the number of distinct observed track IDs.  Route
+            # length, bbox size and sample count are deliberately absent from
+            # the ranking; coverage is capped so repeated samples cannot win.
+            score = len(support_ids) * (0.65 + 0.35 * quality) * (0.75 + 0.25 * evidence_coverage)
             evidence = max(item.end_time for item in cluster)
-            candidates.append(CommonPath(
+            route_vector = polyline[-1] - polyline[0]
+            direction_label = "FORWARD" if (
+                route_vector[0] > 1e-6
+                or (abs(route_vector[0]) <= 1e-6 and route_vector[1] >= 0.0)
+            ) else "REVERSE"
+            path = CommonPath(
                 "", "tracklet", "common_path", "candidate", len(support_ids), len(support_ids),
-                score, quality, "FORWARD", tuple(
+                score, quality, direction_label, tuple(
                     (float(x * self.width), float(y * self.height)) for x, y in polyline
                 ), timestamp, coordinate_space="image_pixels", support_tracks=len(support_ids),
                 evidence_until_s=evidence,
-            ))
+            )
+            candidates.append(path)
+            diagnostic = {
+                "candidate_id": candidate_id,
+                "timestamp": float(timestamp),
+                "raw_track_ids": sorted(int(track_id) for track_id in support_ids),
+                "support_tracks": len(support_ids),
+                "segment_count": len(cluster),
+                "score": float(score),
+                "score_components": {
+                    "support_tracks": len(support_ids),
+                    "temporal_coverage_proxy": float(temporal_coverage),
+                    "mean_quality": float(quality),
+                },
+                "evidence_coverage": evidence_coverage,
+                "direction_consistency": float(
+                    statistics.mean(item.direction_consistency for item in cluster)
+                ),
+                "direction_vector": [float(route_vector[0]), float(route_vector[1])],
+                "direction_label": direction_label,
+                "decision_reason": "POOL_CANDIDATE",
+            }
+            candidate_diagnostic_by_object[id(path)] = self._record_candidate_diagnostic(diagnostic)
 
         candidates.sort(key=lambda item: (-item.score, -item.support_tracks, -item.confidence))
+        self.candidate_pool_count = len(candidates)
         distinct: list[CommonPath] = []
         for candidate in candidates:
             if any(self._path_similarity(candidate, other) >= 0.84 for other in distinct):
                 self.rejections["DUPLICATE_GEOMETRY"] += 1
+                diagnostic = candidate_diagnostic_by_object.get(id(candidate))
+                if diagnostic is not None:
+                    diagnostic["decision_reason"] = "DUPLICATE_GEOMETRY"
+                continue
+            if len(distinct) >= cfg.max_candidates:
+                self.rejections["CANDIDATE_CAP"] += 1
+                diagnostic = candidate_diagnostic_by_object.get(id(candidate))
+                if diagnostic is not None:
+                    diagnostic["decision_reason"] = "MAX_CANDIDATE_CAP"
                 continue
             distinct.append(candidate)
-            if len(distinct) >= cfg.max_candidates:
-                break
+            diagnostic = candidate_diagnostic_by_object.get(id(candidate))
+            if diagnostic is not None:
+                diagnostic["decision_reason"] = "SELECTED_CANDIDATE_POOL"
         self.candidate_count = len(distinct)
         self._update_identities(tuple(distinct), timestamp)
 
@@ -602,7 +878,7 @@ class TrackletAggregationEngine:
             merged = first.copy()
         merged = self._smooth(self._deduplicate(merged), passes=2)
         return tuple(
-            (float(x), float(y)) for x, y in self._resample(merged, min(48, max(8, len(merged))))
+            (float(x), float(y)) for x, y in self._resample_by_spacing(merged)
         )
 
     @staticmethod
@@ -721,6 +997,22 @@ class TrackletAggregationEngine:
             replace(state.path, rank=index + 1)
             for index, state in enumerate(sorted(selected, key=lambda item: (-item.path.score, item.path.path_id)))
         )
+        for path in paths:
+            self._path_support_diagnostics.append({
+                "timestamp": float(timestamp),
+                "path_id": path.path_id,
+                "rank": int(path.rank),
+                "state": path.state,
+                "support_tracks": int(path.support_tracks),
+                # Until passage stitching/ground truth is available, expose
+                # the actual unit instead of presenting temporary IDs as
+                # unique people.
+                "support_unit": "temporary_track_id",
+                "score": float(path.score),
+                "confidence": float(path.confidence),
+                "evidence_until_s": float(path.evidence_until_s),
+                "polyline_points": len(path.polyline),
+            })
         self._snapshot = CommonPathSnapshot(
             timestamp, paths, self._snapshot.version + 1,
             max((path.evidence_until_s for path in paths), default=timestamp),
