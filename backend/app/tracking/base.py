@@ -9,6 +9,19 @@ from backend.app.schemas import Detection, TrackedObject
 
 
 class MultiObjectTracker(Protocol):
-    def update(self, detections: Sequence[Detection], frame: NDArray) -> list[TrackedObject]: ...
+    def update(
+        self,
+        detections: Sequence[Detection],
+        frame: NDArray,
+        *,
+        frame_id: int | None = None,
+    ) -> list[TrackedObject]: ...
+
+    def coast(
+        self,
+        frame: NDArray,
+        *,
+        frame_id: int | None = None,
+    ) -> list[TrackedObject]: ...
 
     def reset(self) -> None: ...

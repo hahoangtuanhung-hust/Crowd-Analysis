@@ -54,6 +54,9 @@ class TrackerConfig(StrictModel):
     stationary_lost_track_grace_frames: int | None = Field(default=None, ge=0)
     stationary_speed_threshold: float = Field(default=3.0, ge=0.0)
     stationary_boost: bool = True
+    motion_cost_weight: float = Field(default=0.35, ge=0.0, le=1.0)
+    motion_direction_penalty: float = Field(default=0.20, ge=0.0, le=1.0)
+    motion_history_alpha: float = Field(default=0.65, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_threshold_order(self) -> TrackerConfig:
@@ -69,6 +72,85 @@ class TrackerConfig(StrictModel):
                 "stationary_lost_track_grace_frames must not be below "
                 "lost_track_grace_frames"
             )
+        return self
+
+
+class MotionBackgroundConfig(StrictModel):
+    method: Literal["mog2"] = "mog2"
+    analysis_width: int = Field(default=640, ge=160, le=1920)
+    warmup_min_s: float = Field(default=2.0, ge=0.0)
+    warmup_max_s: float = Field(default=6.0, gt=0.0)
+    learning_time_constant_s: float = Field(default=10.0, gt=0.0)
+    detect_shadows: bool = True
+    static_confirm_s: float = Field(default=2.0, gt=0.0)
+    max_mask_age_s: float = Field(default=0.15, gt=0.0)
+    foreground_ratio_max: float = Field(default=0.70, gt=0.0, lt=1.0)
+    min_component_area_ratio: float = Field(default=0.00001, ge=0.0, le=1.0)
+
+
+class MotionCoverageConfig(StrictModel):
+    periodic_scan_interval_s: float = Field(default=0.5, gt=0.0)
+    use_validated_reference_profile: bool = True
+    minimum_sample_count: int = Field(default=3, ge=1)
+
+
+class MotionROISelectionConfig(StrictModel):
+    reuse_existing_tiles_first: bool = True
+    max_selected_tiles: int = Field(default=4, ge=1, le=16)
+    bbox_padding_ratio: float = Field(default=0.15, ge=0.0, le=1.0)
+    protect_track_predictions: bool = True
+    prioritize_observation_deadlines: bool = True
+    max_roi_union_ratio: float = Field(default=0.70, gt=0.0, le=1.0)
+
+
+class MotionTrackingConfig(StrictModel):
+    max_observation_gap_s: float = Field(default=1.0, gt=0.0)
+    prediction_grace_s: float = Field(default=1.5, gt=0.0)
+    distinguish_not_searched_from_missed: bool = True
+
+
+class MotionFallbackConfig(StrictModel):
+    enabled: bool = True
+    use_measured_cost_guard: bool = True
+    area_ratio_enter: float = Field(default=0.70, gt=0.0, le=1.0)
+    area_ratio_exit: float = Field(default=0.50, gt=0.0, le=1.0)
+    soft_recovery_confirm_s: float = Field(default=1.0, gt=0.0)
+    max_recovery_s: float = Field(default=4.0, gt=0.0)
+
+
+class MotionDiagnosticsConfig(StrictModel):
+    log_scheduler_decisions: bool = True
+    log_coverage_by_region: bool = True
+    debug_overlay: bool = False
+    max_decisions: int = Field(default=10000, ge=100)
+
+
+class MotionROIConfig(StrictModel):
+    """Optional upstream scheduler; disabled preserves reference behavior."""
+
+    enabled: bool = False
+    shadow_mode: bool = False
+    background: MotionBackgroundConfig = Field(default_factory=MotionBackgroundConfig)
+    coverage: MotionCoverageConfig = Field(default_factory=MotionCoverageConfig)
+    roi: MotionROISelectionConfig = Field(default_factory=MotionROISelectionConfig)
+    tracking: MotionTrackingConfig = Field(default_factory=MotionTrackingConfig)
+    fallback: MotionFallbackConfig = Field(default_factory=MotionFallbackConfig)
+    diagnostics: MotionDiagnosticsConfig = Field(default_factory=MotionDiagnosticsConfig)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> MotionROIConfig:
+        if self.background.warmup_min_s > self.background.warmup_max_s:
+            raise ValueError("motion_roi warmup_min_s must not exceed warmup_max_s")
+        if self.coverage.periodic_scan_interval_s > self.tracking.max_observation_gap_s:
+            raise ValueError(
+                "motion_roi periodic_scan_interval_s must not exceed max_observation_gap_s"
+            )
+        if self.tracking.max_observation_gap_s >= self.tracking.prediction_grace_s:
+            raise ValueError(
+                "motion_roi max_observation_gap_s must be below prediction_grace_s"
+            )
+        if self.fallback.area_ratio_exit > self.fallback.area_ratio_enter:
+            raise ValueError("motion_roi area_ratio_exit must not exceed area_ratio_enter")
         return self
 
 
@@ -122,6 +204,9 @@ class TrackletAggregationConfig(StrictModel):
     max_step_fraction: float = Field(default=0.12, gt=0)
     max_observation_gap_seconds: float = Field(default=0.8, gt=0)
     max_link_gap_seconds: float = Field(default=1.6, gt=0)
+    # Normalized arc length used for the observed, piecewise-linear route.
+    # This controls segment density without introducing spline interpolation.
+    segment_length_fraction: float = Field(default=0.025, gt=0)
     sample_spacing_fraction: float = Field(default=0.012, gt=0)
     match_distance_fraction: float = Field(default=0.025, gt=0)
     match_angle_degrees: float = Field(default=40, gt=0, le=90)
@@ -379,6 +464,7 @@ class AppConfig(StrictModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     detector: DetectorConfig = Field(default_factory=DetectorConfig)
     tracker: TrackerConfig = Field(default_factory=TrackerConfig)
+    motion_roi: MotionROIConfig = Field(default_factory=MotionROIConfig)
     video: VideoConfig = Field(default_factory=VideoConfig)
     analytics: AnalyticsConfig = Field(default_factory=AnalyticsConfig)
     visualization: VisualizationConfig = Field(default_factory=VisualizationConfig)
@@ -391,11 +477,48 @@ class AppConfig(StrictModel):
                 "detector.confidence must not exceed tracker.track_low_thresh; "
                 "otherwise ByteTrack cannot use its low-confidence recovery stage"
             )
+        if self.motion_roi.enabled or self.motion_roi.shadow_mode:
+            if not self.detector.tiled_inference:
+                raise ValueError(
+                    "motion_roi requires detector.tiled_inference so ROI execution "
+                    "can reuse the validated detector profile"
+                )
+            tile_count = self.detector.tile_rows * self.detector.tile_columns
+            if self.motion_roi.roi.max_selected_tiles > tile_count:
+                raise ValueError(
+                    "motion_roi.roi.max_selected_tiles must not exceed the detector tile count"
+                )
         return self
 
 
-def load_config(path: str | Path) -> AppConfig:
-    config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as stream:
+def _merge_config(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_config_mapping(path: Path, stack: tuple[Path, ...] = ()) -> dict:
+    resolved = path.resolve()
+    if resolved in stack:
+        chain = " -> ".join(str(item) for item in (*stack, resolved))
+        raise ValueError(f"Config extends cycle: {chain}")
+    with resolved.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
-    return AppConfig.model_validate(raw)
+    if not isinstance(raw, dict):
+        raise ValueError("Config root must be a mapping")
+    parent = raw.pop("extends", None)
+    if parent is None:
+        return raw
+    parent_path = Path(parent)
+    if not parent_path.is_absolute():
+        parent_path = resolved.parent / parent_path
+    base = _load_config_mapping(parent_path, (*stack, resolved))
+    return _merge_config(base, raw)
+
+
+def load_config(path: str | Path) -> AppConfig:
+    return AppConfig.model_validate(_load_config_mapping(Path(path)))

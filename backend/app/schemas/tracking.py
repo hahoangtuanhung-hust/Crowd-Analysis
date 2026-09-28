@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
 FloatImage = NDArray[np.uint8]
+ObservationCoverage = Literal[
+    "MEASURED",
+    "SEARCHED_NOT_FOUND",
+    "NOT_SEARCHED_BY_POLICY",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +38,7 @@ class TrackedObject:
     confidence: float
     class_id: int = 0
     observed: bool = True
+    observation_coverage: ObservationCoverage = "MEASURED"
 
     @property
     def xyxy(self) -> tuple[float, float, float, float]:
@@ -59,6 +66,15 @@ class FrameResult:
     inference_ms: float
     tracking_ms: float
     processing_completed_monotonic: float
+    observation_mode: str = "FULL_COVERAGE"
+    searched_regions: tuple[tuple[int, int, int, int], ...] = ()
+    scheduler_state: str = "DISABLED"
+    scheduler_reasons: tuple[str, ...] = ()
+    motion_ms: float = 0.0
+    roi_planning_ms: float = 0.0
+    roi_union_ratio: float = 1.0
+    detector_images: int = 1
+    intentional_skip: bool = False
 
     @property
     def e2e_latency_ms(self) -> float:

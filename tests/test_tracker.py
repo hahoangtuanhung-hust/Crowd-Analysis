@@ -103,3 +103,66 @@ def test_stationary_track_uses_longer_grace_period() -> None:
     assert all(len(items) == 1 for items in predicted)
     assert all(items[0].track_id == observed[0].track_id for items in predicted)
     assert expired == []
+
+
+def test_tracker_preserves_id_across_crossing_with_short_occlusion() -> None:
+    tracker = ByteTrackTracker(
+        TrackerConfig(
+            association_mode="hybrid",
+            max_center_distance_ratio=0.10,
+            motion_cost_weight=0.55,
+            motion_direction_penalty=0.35,
+            fuse_score=False,
+            lost_track_grace_frames=6,
+        )
+    )
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    track_ids: dict[int, list[int]] = {0: [], 1: []}
+
+    for step in range(11):
+        left = 24 + step * 11
+        right = 166 - step * 11
+        detections = []
+        if step not in {5, 6}:
+            detections.append(Detection(left, 80, left + 24, 170, 0.9))
+        detections.append(Detection(right, 80, right + 24, 170, 0.9))
+        tracks = tracker.update(detections, frame, frame_id=step)
+        observed = [item for item in tracks if item.observed]
+        if step == 0:
+            assert len(observed) == 2
+            by_x = sorted(observed, key=lambda item: item.x1)
+            track_ids[0].append(by_x[0].track_id)
+            track_ids[1].append(by_x[1].track_id)
+            continue
+        # The left-to-right and right-to-left tracks retain their side/order
+        # through the occlusion; predicted (non-observed) output is allowed.
+        if step not in {5, 6}:
+            assert len(observed) == 2
+            expected_left = left
+            expected_right = right
+            left_track = min(observed, key=lambda item: abs(item.x1 - expected_left))
+            right_track = min(observed, key=lambda item: abs(item.x1 - expected_right))
+            assert left_track.track_id != right_track.track_id
+            track_ids[0].append(left_track.track_id)
+            track_ids[1].append(right_track.track_id)
+
+    assert len(set(track_ids[0])) == 1
+    assert len(set(track_ids[1])) == 1
+    assert track_ids[0][0] != track_ids[1][0]
+
+
+def test_tracker_uses_source_frame_id_when_realtime_drops_frames() -> None:
+    tracker = ByteTrackTracker(
+        TrackerConfig(
+            association_mode="hybrid",
+            max_center_distance_ratio=0.10,
+            motion_cost_weight=0.45,
+            fuse_score=False,
+        )
+    )
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    first = tracker.update([Detection(20, 25, 32, 70, 0.9)], frame, frame_id=0)
+    second = tracker.update([Detection(44, 25, 56, 70, 0.9)], frame, frame_id=3)
+
+    assert len(first) == len(second) == 1
+    assert first[0].track_id == second[0].track_id
