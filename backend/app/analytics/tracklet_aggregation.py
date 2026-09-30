@@ -713,7 +713,17 @@ class TrackletAggregationEngine:
                 np.linalg.norm(starts - ends[index], axis=1),
                 np.linalg.norm(ends - starts[index], axis=1),
             )
-            nearest = np.argsort(np.minimum(center_distance, endpoint_distance))[:neighbor_count + 1]
+            distances = np.minimum(center_distance, endpoint_distance)
+            candidate_count = min(len(tracklets), neighbor_count + 1)
+            # Only the nearest candidate set matters; sorting all N distances
+            # for every tracklet adds O(N^2 log N) work to each compute event.
+            # argpartition preserves the exact candidate set at O(N^2), after
+            # which deterministic ordering keeps diagnostics reproducible.
+            if candidate_count < len(tracklets):
+                nearest = np.argpartition(distances, candidate_count - 1)[:candidate_count]
+                nearest = nearest[np.argsort(distances[nearest], kind="stable")]
+            else:
+                nearest = np.argsort(distances, kind="stable")
             for other_index in nearest:
                 other_index = int(other_index)
                 if other_index != index:

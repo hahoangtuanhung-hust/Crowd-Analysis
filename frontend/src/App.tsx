@@ -324,7 +324,7 @@ function overlayFromVisualization(settings: VisualizationSettings): OverlaySetti
 
 function visualizationFromOverlay(settings: OverlaySettings) {
   return {
-    show_bounding_boxes: false,
+    show_bounding_boxes: settings.detection,
     show_track_ids: settings.track_ids,
     show_tracking_points: settings.points,
     show_individual_trajectories: settings.trajectory_tails,

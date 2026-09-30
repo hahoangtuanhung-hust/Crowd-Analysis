@@ -122,6 +122,7 @@ class ProcessingSession:
         self._frame_version = 0
         self._latest_frame_id = -1
         self._latest_media_timestamp_s = 0.0
+        self._preview_skipped_frames = 0
         # Incremented whenever analytics state is replaced.  An analytics
         # worker may finish an old frame after a config/ROI update; its output
         # must not overwrite the newer state or rendered frame.
@@ -254,6 +255,7 @@ class ProcessingSession:
             analytics_dropped_frames=self._analytics_queue.dropped,
         )
         metrics["frame_queue_size"] = metrics["capture_queue_size"]
+        metrics["preview_skipped_frames"] = self._preview_skipped_frames
         metrics.update({
             "motion_roi_enabled": bool(self.motion_scheduler is not None),
             "motion_roi_reference_scans": self.pipeline.stats.reference_scans,
@@ -319,9 +321,34 @@ class ProcessingSession:
                     and trajectory.points[-1].frame_id == item.packet.frame_id
                 )
                 heatmap = engine.heatmap("current")
+                common_path_started = time.perf_counter()
                 common_paths = engine.common_path_snapshot()
                 directed_flows = engine.common_path_flows()
+                common_path_ms = (time.perf_counter() - common_path_started) * 1000.0
                 analytics_ms = (time.perf_counter() - started) * 1000.0
+
+                # When realtime analytics has fallen behind, rendering every
+                # stale intermediate frame only increases latency.  Preserve
+                # every analytics observation, but coalesce preview work until
+                # this worker reaches the newest queued result.
+                queued_items = self._analytics_queue.size
+                pipeline_running = self.pipeline.stats.running
+                # After capture completes, the queue also contains one end
+                # marker.  Do not mistake that marker for a newer frame or the
+                # final preview would never be published.
+                stale_preview = (
+                    queued_items > 0 if pipeline_running else queued_items > 1
+                )
+                if self.realtime and stale_preview:
+                    self._preview_skipped_frames += 1
+                    self.monitor.record(
+                        item,
+                        analytics_ms=analytics_ms,
+                        common_path_ms=common_path_ms,
+                        render_ms=None,
+                        encoding_ms=None,
+                    )
+                    continue
 
                 render_started = time.perf_counter()
                 frame = self.renderer.render(
@@ -352,6 +379,7 @@ class ProcessingSession:
                 self.monitor.record(
                     item,
                     analytics_ms=analytics_ms,
+                    common_path_ms=common_path_ms,
                     render_ms=render_ms,
                     encoding_ms=encoding_ms,
                 )
@@ -377,6 +405,9 @@ class ProcessingSession:
                                 "fps": metrics["processing_fps"],
                                 "inference_ms": metrics["inference_ms"],
                                 "tracking_ms": metrics["tracking_ms"],
+                                "common_path_ms": metrics.get("common_path_ms"),
+                                "common_path_ms_p95": metrics.get("common_path_ms_p95"),
+                                "detector_images_per_frame": metrics.get("detector_images_per_source_frame"),
                                 "queue_size": metrics["queue_size"],
                             },
                             separators=(",", ":"),
@@ -403,6 +434,7 @@ class SessionManager:
         self.config = config
         self._detector_factory = detector_factory
         self._detector: PersonDetector | None = None
+        self._detector_warmed = False
         self._session: ProcessingSession | None = None
         self._calibration: tuple[list[tuple[float, float]], float, float] | None = None
         self._zones: list[ZoneConfig] = []
@@ -447,6 +479,15 @@ class SessionManager:
                 visualization=self._visualization,
                 max_frames=max_frames,
             )
+            if not self._detector_warmed:
+                warmup = getattr(self._detector, "warmup", None)
+                if callable(warmup):
+                    warmup(
+                        frame_width=session.metadata.width,
+                        frame_height=session.metadata.height,
+                        warmup_passes=2,
+                    )
+                self._detector_warmed = True
             if self._calibration is not None:
                 points, width, height = self._calibration
                 session.set_calibration(points, width=width, height=height)

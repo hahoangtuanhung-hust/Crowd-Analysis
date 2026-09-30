@@ -16,6 +16,7 @@ from backend.app.schemas import (
     DirectedFlowSnapshot,
     FrameResult,
     HeatmapSnapshot,
+    TrackedObject,
     Trajectory,
 )
 
@@ -105,7 +106,6 @@ class FrameRenderer:
         # Overlay points must belong to this exact frame; smoothed histories are analytics state.
         points = [_CurrentPoint(track.track_id, *track.bottom_center)
                   for track in result.tracks if track.observed]
-
         return self.render_point_only_frame(
             frame,
             points,
@@ -119,6 +119,7 @@ class FrameRenderer:
             timestamp=result.packet.source_timestamp,
             directed_flows=directed_flows,
             debug_trajectories=debug_trajectories,
+            tracked_objects=tuple(track for track in result.tracks if track.observed),
         )
 
     def render_point_only_frame(
@@ -136,8 +137,11 @@ class FrameRenderer:
         timestamp: float,
         directed_flows: DirectedFlowSnapshot | None = None,
         debug_trajectories: tuple[Trajectory, ...] = (),
+        tracked_objects: Sequence[TrackedObject] = (),
     ) -> NDArray[np.uint8]:
         rendered = frame.copy()
+        if options.detection:
+            self._draw_tracking_boxes(rendered, tracked_objects)
         if options.grid and directed_flows is not None:
             self._draw_grid(rendered, directed_flows, transformer)
         if options.edge_flows and directed_flows is not None:
@@ -468,6 +472,21 @@ class FrameRenderer:
                     1,
                     cv2.LINE_AA,
                 )
+
+    @staticmethod
+    def _draw_tracking_boxes(
+        frame: NDArray[np.uint8], tracks: Sequence[TrackedObject]
+    ) -> None:
+        height, width = frame.shape[:2]
+        color = (80, 200, 120)
+        for track in tracks:
+            x1 = min(width - 1, max(0, round(track.x1)))
+            y1 = min(height - 1, max(0, round(track.y1)))
+            x2 = min(width - 1, max(0, round(track.x2)))
+            y2 = min(height - 1, max(0, round(track.y2)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
 
     @staticmethod
     def _draw_debug_trajectories(

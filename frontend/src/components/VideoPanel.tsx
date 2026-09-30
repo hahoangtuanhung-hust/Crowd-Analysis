@@ -127,6 +127,7 @@ export function VideoPanel({ session, frameUrl, overlay, onOverlayChange, onCali
         )}
       </div>
       <div className="overlay-controls" aria-label="Video overlays">
+        <Toggle label="Bounding Boxes" checked={overlay.detection} disabled={!session || !editable} onChange={(value) => update("detection", value)} />
         <Toggle label="Tracking Points" checked={overlay.points} disabled={!session || !editable} onChange={(value) => update("points", value)} />
         <Toggle label="Common Path" checked={overlay.active_paths} disabled={!session || !editable} onChange={(value) => update("active_paths", value)} />
         <Toggle label="Direction Arrows" checked={overlay.direction_arrows} disabled={!session || !overlay.active_paths || !editable} onChange={(value) => update("direction_arrows", value)} />

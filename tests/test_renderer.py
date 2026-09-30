@@ -94,6 +94,116 @@ def test_tracking_overlay_draws_bottom_center_point_without_bbox() -> None:
     assert not rendered[80, 100].any()
 
 
+def test_bounding_box_overlay_draws_observed_track_box_when_enabled() -> None:
+    frame = np.zeros((200, 240, 3), dtype=np.uint8)
+    packet = FramePacket(0, 0.0, 1.0, frame)
+    result = FrameResult(
+        packet=packet,
+        detections=(Detection(100, 80, 120, 140, 0.9),),
+        tracks=(TrackedObject(7, 100, 80, 120, 140, 0.9),),
+        inference_ms=12.0,
+        tracking_ms=2.0,
+        processing_completed_monotonic=1.1,
+    )
+    analytics = AnalyticsConfig()
+    heatmap = HeatmapSnapshot(
+        "current",
+        "pixel",
+        0.0,
+        0.0,
+        np.zeros((analytics.grid_height, analytics.grid_width), dtype=np.float32),
+        np.zeros((analytics.grid_height, analytics.grid_width), dtype=np.float32),
+    )
+
+    rendered = FrameRenderer().render(
+        result,
+        (),
+        heatmap,
+        (),
+        SpatialTransformer.pixel(240, 200),
+        OverlayOptions(
+            detection=True,
+            tracking=False,
+            trajectory=False,
+            zones=False,
+            debug_metrics=False,
+        ),
+        processing_fps=10.0,
+    )
+
+    assert rendered[80, 100].any()
+    assert rendered[110, 110].sum() == 0
+
+
+def test_bounding_box_overlay_ignores_unobserved_track() -> None:
+    frame = np.zeros((200, 240, 3), dtype=np.uint8)
+    packet = FramePacket(0, 0.0, 1.0, frame)
+    result = FrameResult(
+        packet=packet,
+        detections=(),
+        tracks=(TrackedObject(7, 100, 80, 120, 140, 0.9, observed=False),),
+        inference_ms=12.0,
+        tracking_ms=2.0,
+        processing_completed_monotonic=1.1,
+    )
+    analytics = AnalyticsConfig()
+    heatmap = HeatmapSnapshot(
+        "current",
+        "pixel",
+        0.0,
+        0.0,
+        np.zeros((analytics.grid_height, analytics.grid_width), dtype=np.float32),
+        np.zeros((analytics.grid_height, analytics.grid_width), dtype=np.float32),
+    )
+
+    rendered = FrameRenderer().render(
+        result,
+        (),
+        heatmap,
+        (),
+        SpatialTransformer.pixel(240, 200),
+        OverlayOptions(
+            detection=True,
+            tracking=False,
+            trajectory=False,
+            zones=False,
+            debug_metrics=False,
+        ),
+        processing_fps=10.0,
+    )
+
+    assert not rendered.any()
+
+
+def test_point_only_renderer_can_draw_batch_tracking_boxes() -> None:
+    frame = np.zeros((200, 240, 3), dtype=np.uint8)
+    track = TrackedObject(7, 100, 80, 120, 140, 0.9)
+
+    rendered = FrameRenderer().render_point_only_frame(
+        frame,
+        (),
+        None,
+        (),
+        SpatialTransformer.pixel(240, 200),
+        OverlayOptions(
+            detection=True,
+            tracking=False,
+            trajectory=False,
+            zones=False,
+            active_paths=False,
+            debug_metrics=False,
+        ),
+        people_count=1,
+        processing_fps=10.0,
+        latency_ms=12.0,
+        timestamp=0.0,
+        tracked_objects=(track,),
+    )
+
+    assert rendered[80, 100].any()
+    assert rendered[110, 110].sum() == 0
+
+
 def test_active_common_path_is_drawn_from_snapshot() -> None:
     analytics = AnalyticsConfig(grid_width=8, grid_height=6)
     result = frame_result()

@@ -62,11 +62,16 @@ def test_api_upload_process_and_analytics(tmp_path: Path) -> None:
 
         updated_visualization = client.patch(
             "/api/config/visualization",
-            json={"show_zones": True, "show_direction_arrows": False},
+            json={
+                "show_zones": True,
+                "show_direction_arrows": False,
+                "show_bounding_boxes": True,
+            },
         )
         assert updated_visualization.status_code == 200
         assert updated_visualization.json()["show_zones"] is True
         assert updated_visualization.json()["show_direction_arrows"] is False
+        assert updated_visualization.json()["show_bounding_boxes"] is True
 
         with video_path.open("rb") as stream:
             uploaded = client.post(

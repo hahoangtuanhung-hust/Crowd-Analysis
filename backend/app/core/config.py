@@ -156,6 +156,10 @@ class MotionROIConfig(StrictModel):
 
 class VideoConfig(StrictModel):
     inference_interval: int = Field(default=1, ge=1)
+    # Offline-only source microbatch controls. Live TrackingPipeline continues
+    # to process one source frame at a time to preserve its latency contract.
+    source_batch_size: int = Field(default=1, ge=1, le=16)
+    max_detector_images_per_batch: int = Field(default=20, ge=1, le=80)
     queue_size: int = Field(default=4, ge=1, le=128)
     analytics_queue_size: int = Field(default=1000, ge=1, le=100_000)
     stale_frame_policy: Literal["drop_oldest", "block"] = "drop_oldest"

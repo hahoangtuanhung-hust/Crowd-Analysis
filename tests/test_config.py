@@ -35,6 +35,41 @@ def test_shibuya_config_enables_small_person_detection() -> None:
     assert config.tracker.stationary_lost_track_grace_frames == 30
 
 
+def test_shibuya_realtime_candidate_resolves_relative_parent() -> None:
+    config = load_config(Path("configs/shibuya-realtime-candidate.yaml"))
+
+    assert config.detector.precision == "fp16"
+    assert config.detector.tiled_inference is True
+    assert config.detector.tile_include_full_frame is True
+    assert config.video.source_batch_size == 2
+    assert config.video.max_detector_images_per_batch == 10
+    assert config.analytics.common_path.max_paths == 3
+
+
+def test_shibuya_fp16_variants_keep_three_common_paths() -> None:
+    baseline = load_config(Path("configs/shibuya.yaml"))
+    for path in (
+        "configs/shibuya-fp16.yaml",
+        "configs/shibuya-fp16-batch2.yaml",
+        "configs/shibuya-fp16-batch4.yaml",
+        "configs/shibuya-realtime-candidate.yaml",
+    ):
+        config = load_config(Path(path))
+        assert config.analytics.common_path.max_paths == 3
+        assert config.tracker == baseline.tracker
+
+
+def test_shibuya_fp32_batch2_changes_only_offline_batch_limits() -> None:
+    baseline = load_config(Path("configs/shibuya.yaml"))
+    batch2 = load_config(Path("configs/shibuya-fp32-batch2.yaml"))
+
+    assert batch2.detector == baseline.detector
+    assert batch2.tracker == baseline.tracker
+    assert batch2.analytics == baseline.analytics
+    assert batch2.video.source_batch_size == 2
+    assert batch2.video.max_detector_images_per_batch == 10
+
+
 def test_tracker_rejects_inverted_thresholds() -> None:
     with pytest.raises(ValidationError):
         TrackerConfig(track_low_thresh=0.5, track_high_thresh=0.2)
