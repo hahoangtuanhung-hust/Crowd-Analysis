@@ -1,0 +1,7 @@
+# Offline gpu_clip ablation retained for reproducibility after batch 2 won.
+extends: shibuya-fp16.yaml
+
+video:
+  source_batch_size: 4
+  max_detector_images_per_batch: 20
+

@@ -1,0 +1,24 @@
+# shibuya-realtime-candidate.yaml
+# Selected benchmark candidate — FP16 tiled, source batch 2, no per-frame synchronize.
+# Extends shibuya-fp16.yaml; only the offline source-batch limits differ.
+# The 25-second T4 FP16 batch ablation measured batch 2 faster than batch 1 and batch 4.
+# Re-run this aligned profile before using cross-precision performance claims.
+# DO NOT merge into default.yaml; keep as experimental profile.
+
+extends: shibuya-fp16.yaml
+
+motion_roi:
+  enabled: false
+  shadow_mode: false
+
+video:
+  inference_interval: 1
+  # Offline gpu_clip only: 2 source frames x 5 detector images = 10 images.
+  # Motion ROI automatically falls back to source_batch_size=1.
+  source_batch_size: 2
+  max_detector_images_per_batch: 10
+  queue_size: 4
+  analytics_queue_size: 1000
+  stale_frame_policy: drop_oldest
+  reconnect_initial_seconds: 1.0
+  reconnect_max_seconds: 30.0

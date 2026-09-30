@@ -1,0 +1,8 @@
+# Offline gpu_clip ablation: FP16 with two source frames per model call.
+# Keeps detector/tracker/analytics semantics from shibuya-fp16.yaml.
+extends: shibuya-fp16.yaml
+
+video:
+  source_batch_size: 2
+  max_detector_images_per_batch: 10
+

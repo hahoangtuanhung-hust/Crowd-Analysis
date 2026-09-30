@@ -1,0 +1,7 @@
+# Offline gpu_clip ablation: FP32 with two source frames per model call.
+# This isolates source batching from the separate FP16 numerical change.
+extends: shibuya.yaml
+
+video:
+  source_batch_size: 2
+  max_detector_images_per_batch: 10
