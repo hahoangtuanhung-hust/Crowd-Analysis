@@ -13,6 +13,8 @@ from pathlib import Path
 import modal
 
 VOLUME_NAME = "crowd-analysis-data"
+CPU_REQUEST_DEFAULT = 2.0
+CPU_REQUEST_CHOICES = (1.0, 2.0, 4.0, 8.0)
 volume = modal.Volume.from_name(VOLUME_NAME)
 app = modal.App("crowd-common-path-clip")
 image = (
@@ -28,20 +30,32 @@ image = (
 )
 
 
-@app.function(image=image, gpu="T4", volumes={"/root/data": volume},
+@app.function(image=image, gpu="T4", volumes={"/root/data": volume,},
 # A 10-minute Shibuya video is substantially slower than wall-clock in the
 # current detector/render pipeline. Keep one invocation alive long enough for
 # the batch to finish; the function still writes its manifest to the Volume.
-              max_containers=1, timeout=14400, retries=0)
+              max_containers=1, timeout=14400, retries=0, cpu=CPU_REQUEST_DEFAULT)
 def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds: float,
-             duration_seconds: float | None, engine: str, run_id: str) -> dict:
+            duration_seconds: float | None, engine: str, run_id: str,
+            profile_gpu: bool = False,
+            cpu_request_physical_cores: float = CPU_REQUEST_DEFAULT) -> dict:
     import datetime as dt
     import sys
     import threading
     import subprocess
     import psutil
+    worker_threads = max(1, int(cpu_request_physical_cores))
+    for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ[variable] = str(worker_threads)
     sys.path.insert(0, "/root")
     import torch
+    torch.set_num_threads(worker_threads)
+    try:
+        torch.set_num_interop_threads(min(2, worker_threads))
+    except RuntimeError:
+        # PyTorch permits configuring inter-op threads only before parallel
+        # work starts. A pre-initialized runtime is still reported below.
+        pass
     if not torch.cuda.is_available():
         raise RuntimeError("Modal GPU unavailable; inference refused")
     from scripts.common_path_clip import digest, run
@@ -90,7 +104,7 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
         manifest = run(source, output, config_path=config, model_path=model,
                        start_seconds=start_seconds, duration_seconds=duration_seconds,
                        engine=engine, run_id=run_id, input_hash=source_hash,
-                       model_hash=model_hash)
+                       model_hash=model_hash, profile_gpu=profile_gpu)
         stop_sampling.set()
         sampler.join(timeout=3)
         elapsed = time.monotonic() - started
@@ -99,18 +113,23 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
             "".join(json.dumps(item, separators=(",", ":")) + "\n" for item in samples),
             encoding="utf-8",
         )
-        cpu_values = [float(item["cpu_percent"]) for item in samples]
-        ram_values = [float(item["ram_mb"]) for item in samples]
-        gpu_values = [float(item["gpu_utilization_percent"]) for item in samples
-                      if item["gpu_utilization_percent"] is not None]
-        gpu_memory_values = [float(item["gpu_memory_used_mb"]) for item in samples
-                             if item["gpu_memory_used_mb"] is not None]
+        # `samples` also contains lifecycle events such as `warmup_completed`.
+        # Only resource samples carry utilization fields, so aggregate optional
+        # values instead of treating event rows as resource measurements.
+        cpu_values = [float(value) for item in samples
+                      if (value := item.get("cpu_percent")) is not None]
+        ram_values = [float(value) for item in samples
+                      if (value := item.get("ram_mb")) is not None]
+        gpu_values = [float(value) for item in samples
+                      if (value := item.get("gpu_utilization_percent")) is not None]
+        gpu_memory_values = [float(value) for item in samples
+                             if (value := item.get("gpu_memory_used_mb")) is not None]
         resources = {
             "started_at_utc": wall_started.isoformat(),
             "completed_at_utc": completed_at.isoformat(),
             "remote_wall_seconds": round(elapsed, 3),
             "sample_interval_seconds": 1,
-            "sample_count": len(samples),
+            "sample_count": len(cpu_values),
             "cpu_percent_avg": round(sum(cpu_values) / len(cpu_values), 3) if cpu_values else None,
             "cpu_percent_peak": round(max(cpu_values), 3) if cpu_values else None,
             "ram_peak_mb": round(max(ram_values), 3) if ram_values else None,
@@ -118,6 +137,18 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
             "gpu_utilization_peak_percent": round(max(gpu_values), 3) if gpu_values else None,
             "gpu_memory_used_peak_mb": round(max(gpu_memory_values), 3) if gpu_memory_values else None,
             "gpu": torch.cuda.get_device_name(0),
+            "cpu_request_physical_cores": cpu_request_physical_cores,
+            "cpu_affinity_logical_cpus": (
+                len(process.cpu_affinity()) if hasattr(process, "cpu_affinity") else None
+            ),
+            "threading": {
+                "torch_intraop_threads": torch.get_num_threads(),
+                "torch_interop_threads": torch.get_num_interop_threads(),
+                "opencv_threads": __import__("cv2").getNumThreads(),
+                "OMP_NUM_THREADS": os.getenv("OMP_NUM_THREADS"),
+                "MKL_NUM_THREADS": os.getenv("MKL_NUM_THREADS"),
+                "OPENBLAS_NUM_THREADS": os.getenv("OPENBLAS_NUM_THREADS"),
+            },
         }
         (output / "resource_summary.json").write_text(json.dumps(resources, indent=2), encoding="utf-8")
         summary_path = output / "summary.json"
@@ -133,6 +164,7 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
         manifest["remote_wall_seconds"] = round(elapsed, 2)
         manifest["completed_at_utc"] = resources["completed_at_utc"]
         manifest["resource_summary"] = resources
+        manifest["cpu_request_physical_cores"] = cpu_request_physical_cores
         manifest["gpu"] = torch.cuda.get_device_name(0)
         manifest["artifacts"] = sorted(path.name for path in output.iterdir() if path.is_file())
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -144,6 +176,7 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
         output.mkdir(parents=True, exist_ok=True)
         (output / "manifest.json").write_text(json.dumps(dict(
             run_id=run_id, status="failed", error=str(exc),
+            cpu_request_physical_cores=cpu_request_physical_cores,
             remote_wall_seconds=round(time.monotonic() - started, 2))), encoding="utf-8")
         volume.commit()
         raise
@@ -167,12 +200,22 @@ def _sha256(path: Path) -> str:
     return result.hexdigest()
 
 
+def _validate_cpu_request(cpu: float) -> float:
+    value = float(cpu)
+    if value not in CPU_REQUEST_CHOICES:
+        choices = ", ".join(str(int(item)) for item in CPU_REQUEST_CHOICES)
+        raise ValueError(f"cpu must be one of: {choices}")
+    return value
+
+
 @app.local_entrypoint()
 def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
          duration_seconds: float | None = None, engine: str = "tracklet_aggregation",
          mode: str = "offline_fast", config: str = "configs/default.yaml",
          run_id: str = "", cache_policy: str = "reuse",
-         download_artifacts: bool = False) -> None:
+         download_artifacts: bool = False,
+         profile_gpu: bool = False,
+         cpu: float = CPU_REQUEST_DEFAULT) -> None:
     if mode != "offline_fast":
         raise ValueError("The batch runner only supports offline_fast; UI realtime is separate")
     if cache_policy not in ("reuse", "refresh") or engine not in ("legacy", "directional_grid", "tracklet_aggregation", "shadow"):
@@ -181,6 +224,7 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
         raise ValueError("Start must be >=0 seconds")
     if duration_seconds is not None and duration_seconds <= 0:
         raise ValueError("Duration must be >0 seconds when provided")
+    cpu = _validate_cpu_request(cpu)
     source, settings, model = Path(input), Path(config), Path("yolo26n.pt")
     for path in (source, settings, model):
         if not path.is_file():
@@ -196,8 +240,12 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
     # config payload to the ephemeral worker.
     import yaml
     from backend.app.core.config import load_config
+    resolved_config = load_config(settings)
+    # Modal batch artifacts are review outputs: include the tracker boxes in
+    # every rendered video while keeping the source profile unchanged on disk.
+    resolved_config.visualization.show_bounding_boxes = True
     resolved_config_text = yaml.safe_dump(
-        load_config(settings).model_dump(mode="json"),
+        resolved_config.model_dump(mode="json"),
         sort_keys=False,
     )
     remote_input = f"common_path/inputs/{source_hash}.mp4"
@@ -213,8 +261,18 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
         if cache_policy == "refresh":
             upload_args.insert(1, "--force")
         _cli(*upload_args)
-    manifest = gpu_clip.remote(source_hash, model_hash, resolved_config_text,
-                               start_seconds, duration_seconds, engine, run_id)
+    configured_gpu_clip = gpu_clip.with_options(cpu=cpu)
+    manifest = configured_gpu_clip.remote(
+        source_hash,
+        model_hash,
+        resolved_config_text,
+        start_seconds,
+        duration_seconds,
+        engine,
+        run_id,
+        profile_gpu=profile_gpu,
+        cpu_request_physical_cores=cpu,
+    )
     if manifest.get("status") != "success":
         raise RuntimeError(f"Remote run failed: {manifest}")
     remote_path = f"{VOLUME_NAME}:common_path/runs/{run_id}"

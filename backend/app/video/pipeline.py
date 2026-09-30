@@ -221,7 +221,21 @@ class TrackingPipeline:
                     motion_ms = 0.0
                     planning_ms = 0.0
                     union_ratio = 1.0
-                    detector_images = 1
+                    # Cache replay performs no model work.  A normal detector
+                    # may execute a full frame plus several tiles, so never
+                    # hard-code this counter to one.
+                    if callable(packet_detector):
+                        detector_images = 0
+                    else:
+                        image_count_provider = getattr(
+                            self.detector, "reference_image_count", None
+                        )
+                        detector_images = (
+                            int(image_count_provider(width, height))
+                            if callable(image_count_provider)
+                            else 1
+                        )
+                    self._detector_images += detector_images
                     intentional_skip = False
                 else:
                     (

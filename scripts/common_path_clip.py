@@ -38,6 +38,65 @@ PROVENANCE_SCHEMA = "common-path-provenance-v2"
 DIAGNOSTIC_REGIONS = ("upper", "middle", "lower")
 
 
+def resolve_source_batch_size(
+    *,
+    requested: int,
+    max_detector_images: int,
+    detector_images_per_frame: int,
+    motion_enabled: bool,
+    batch_supported: bool,
+    replay_cache: bool,
+) -> tuple[int, str | None]:
+    """Resolve an offline source batch without changing observation semantics."""
+    if replay_cache:
+        return 1, "CACHE_REPLAY"
+    maximum = max(1, max_detector_images // max(1, detector_images_per_frame))
+    effective = min(requested, maximum)
+    if motion_enabled and effective > 1:
+        return 1, "MOTION_ROI_TRACK_FEEDBACK"
+    if effective > 1 and not batch_supported:
+        return 1, "DETECTOR_BATCH_UNSUPPORTED"
+    if effective < requested:
+        return effective, "MAX_DETECTOR_IMAGES_PER_BATCH"
+    return effective, None
+
+
+def read_source_batch(
+    capture: object,
+    *,
+    start_frame_id: int,
+    end_frame_exclusive: int,
+    source_batch_size: int,
+    fps: float,
+    last_timestamp: float,
+) -> tuple[list[np.ndarray], list[dict[str, Any]], float]:
+    """Read one bounded, ordered source batch and allow a partial EOF batch."""
+    frames: list[np.ndarray] = []
+    metadata: list[dict[str, Any]] = []
+    batch_last_time = last_timestamp
+    for frame_id in range(
+        start_frame_id,
+        min(end_frame_exclusive, start_frame_id + source_batch_size),
+    ):
+        decode_started = time.perf_counter()
+        ok, frame = capture.read()
+        if not ok:
+            break
+        decode_ms = (time.perf_counter() - decode_started) * 1000
+        raw_pts = float(capture.get(cv2.CAP_PROP_POS_MSEC)) / 1000
+        timestamp = raw_pts if raw_pts > batch_last_time else frame_id / fps
+        if timestamp < batch_last_time:
+            raise ValueError("Media timestamps moved backwards")
+        batch_last_time = timestamp
+        frames.append(frame)
+        metadata.append({
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "decode_ms": decode_ms,
+        })
+    return frames, metadata, batch_last_time
+
+
 def digest(path: Path) -> str:
     result = hashlib.sha256()
     with path.open("rb") as source:
@@ -355,8 +414,10 @@ def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]])
     """Write stage percentiles and bounded video-time windows from one run."""
     stages = (
         ("decode", "decode_ms"),
-        ("detector_model", "model_predict_ms"),
-        ("detector_postprocess_merge", "postprocess_ms"),
+        ("ultralytics_predict_wrapper", "model_predict_ms"),
+        ("result_transfer", "result_transfer_ms"),
+        ("project_postprocess_including_merge", "postprocess_ms"),
+        ("tile_merge", "merge_ms"),
         ("inference_total", "inference_ms"),
         ("tracking", "tracking_ms"),
         ("common_path", "analytics_ms"),
@@ -433,7 +494,13 @@ def cache_key(input_hash: str, model_hash: str, config: object, start: float,
     data = dict(schema=CACHE_SCHEMA, input_hash=input_hash,
                 model_hash=model_hash, start=start, duration=duration,
                 detector=config.detector.model_dump(exclude={"device", "model"}),
-                tracker=config.tracker.model_dump())
+                tracker=config.tracker.model_dump(),
+                offline_batch={
+                    "source_batch_size": config.video.source_batch_size,
+                    "max_detector_images_per_batch": (
+                        config.video.max_detector_images_per_batch
+                    ),
+                })
     motion = getattr(config, "motion_roi", None)
     if motion is not None and (motion.enabled or motion.shadow_mode):
         # A hybrid run observes a different subset of the source than a
@@ -448,7 +515,16 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         start_seconds: float, duration_seconds: float | None, run_id: str, engine: str,
         replay_cache: Path | None = None, input_hash: str | None = None,
         model_hash: str | None = None, rebuild_tracks: bool = False,
-        allow_cache_key_mismatch: bool = False) -> dict:
+        allow_cache_key_mismatch: bool = False,
+        profile_gpu: bool = False) -> dict:
+    """Run video inference or analytics replay.
+
+    Args:
+        profile_gpu: When True, calls torch.cuda.synchronize() before/after each
+            inference batch so GPU timing is isolated.  This adds ~50-80 ms per
+            frame of blocking overhead; never use in production benchmarks.
+            Default False preserves GPU pipeline overlap for maximum throughput.
+    """
     if start_seconds < 0:
         raise ValueError("Start must be >=0 seconds")
     if duration_seconds is not None and duration_seconds <= 0:
@@ -504,6 +580,11 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     device = "none (CPU analytics replay)"
     cuda_runtime = None
     detector = tracker = None
+    detector_warmup_ms = 0.0
+    requested_source_batch_size = int(config.video.source_batch_size)
+    effective_source_batch_size = 1
+    source_batch_fallback_reason: str | None = None
+    detector_images_per_reference = 1
     if replay_cache is None:
         import torch
         if not torch.cuda.is_available():
@@ -518,6 +599,44 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         )
         detector = UltralyticsPersonDetector(detection_config)
         tracker = ByteTrackTracker(config.tracker)
+        image_count_provider = getattr(detector, "reference_image_count", None)
+        detector_images_per_reference = (
+            int(image_count_provider(width, height))
+            if callable(image_count_provider) else 1
+        )
+        effective_source_batch_size, source_batch_fallback_reason = (
+            resolve_source_batch_size(
+                requested=requested_source_batch_size,
+                max_detector_images=int(config.video.max_detector_images_per_batch),
+                detector_images_per_frame=detector_images_per_reference,
+                motion_enabled=motion_enabled,
+                batch_supported=callable(getattr(detector, "detect_batch", None)),
+                replay_cache=False,
+            )
+        )
+        # Warm the exact detector instance and batch shape used by the timed
+        # loop. A batch-1 warmup does not allocate the batch-4 working set.
+        warmup = getattr(detector, "warmup", None)
+        if callable(warmup):
+            warmup_started = time.perf_counter()
+            warmup(
+                frame_width=width,
+                frame_height=height,
+                warmup_passes=2,
+                source_batch_size=effective_source_batch_size,
+            )
+            detector_warmup_ms = (time.perf_counter() - warmup_started) * 1000.0
+    else:
+        effective_source_batch_size, source_batch_fallback_reason = (
+            resolve_source_batch_size(
+                requested=requested_source_batch_size,
+                max_detector_images=int(config.video.max_detector_images_per_batch),
+                detector_images_per_frame=detector_images_per_reference,
+                motion_enabled=motion_enabled,
+                batch_supported=False,
+                replay_cache=True,
+            )
+        )
     cache_key_match: bool | None = None
     if replay_cache is not None:
         meta_path = replay_cache.with_suffix(".meta.json")
@@ -574,20 +693,102 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     diagnostic_limit = int(getattr(getattr(motion_config, "diagnostics", None), "max_decisions", 10000))
     diagnostic_stride = max(1, math.ceil(max(1, end_frame - start_frame) / diagnostic_limit))
     began = time.perf_counter()
+    prepared_frames: list[dict[str, Any]] = []
+    inference_batch_sequence = 0
     try:
         for frame_id in range(start_frame, end_frame):
             t0 = time.perf_counter()
-            ok, frame = cap.read()
-            if not ok:
-                break
-            decode_ms = (time.perf_counter() - t0) * 1000
+            prepared: dict[str, Any] | None = None
+            if effective_source_batch_size > 1 and cache_reader is None:
+                if not prepared_frames:
+                    batch_frames, batch_metadata, _ = read_source_batch(
+                        cap,
+                        start_frame_id=frame_id,
+                        end_frame_exclusive=end_frame,
+                        source_batch_size=effective_source_batch_size,
+                        fps=fps,
+                        last_timestamp=last_time,
+                    )
+                    if not batch_frames:
+                        break
+                    import torch
+                    batch_inference_started = time.perf_counter()
+                    if profile_gpu:
+                        torch.cuda.synchronize()
+                    batch_detections = detector.detect_batch(batch_frames)
+                    if profile_gpu:
+                        torch.cuda.synchronize()
+                    batch_inference_ms = (
+                        time.perf_counter() - batch_inference_started
+                    ) * 1000
+                    batch_stats = dict(
+                        getattr(detector, "last_inference_stats", {}) or {}
+                    )
+                    source_count = len(batch_frames)
+                    inference_batch_sequence += 1
+                    amortized_fields = (
+                        "model_predict_ms",
+                        "ultralytics_predict_ms",
+                        "result_transfer_ms",
+                        "postprocess_ms",
+                        "merge_ms",
+                    )
+                    for index, (batch_frame, metadata, detections_for_frame) in enumerate(
+                        zip(batch_frames, batch_metadata, batch_detections, strict=True)
+                    ):
+                        per_frame_stats = dict(batch_stats)
+                        for field in amortized_fields:
+                            value = batch_stats.get(field)
+                            per_frame_stats[field] = (
+                                float(value) / source_count if value is not None else None
+                            )
+                        per_frame_stats.update({
+                            "model_invocations": 1 if index == 0 else 0,
+                            "inference_images": detector_images_per_reference,
+                            "batch_size": int(batch_stats.get("batch_size") or 0),
+                            "source_batch_size": source_count,
+                            "inference_batch_id": inference_batch_sequence,
+                        })
+                        batch_shapes = batch_stats.get("actual_tensor_shapes")
+                        if isinstance(batch_shapes, list):
+                            shape_start = index * detector_images_per_reference
+                            frame_shapes = batch_shapes[
+                                shape_start:shape_start + detector_images_per_reference
+                            ]
+                            per_frame_stats["actual_tensor_shapes"] = frame_shapes
+                            per_frame_stats["sum_tensor_pixels"] = sum(
+                                int(shape[0]) * int(shape[1])
+                                for shape in frame_shapes
+                                if isinstance(shape, (list, tuple)) and len(shape) >= 2
+                            )
+                        prepared_frames.append({
+                            **metadata,
+                            "frame": batch_frame,
+                            "detections": detections_for_frame,
+                            "inference_ms": batch_inference_ms / source_count,
+                            "detector_stats": per_frame_stats,
+                            "detector_images": detector_images_per_reference,
+                            "batch_index": index,
+                        })
+                prepared = prepared_frames.pop(0)
+                if int(prepared["frame_id"]) != frame_id:
+                    raise RuntimeError("Prepared inference frame order mismatch")
+                frame = prepared["frame"]
+                decode_ms = float(prepared["decode_ms"])
+                timestamp = float(prepared["timestamp"])
+                last_time = timestamp
+            else:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                decode_ms = (time.perf_counter() - t0) * 1000
+                raw_pts = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000
+                timestamp = raw_pts if raw_pts > last_time else frame_id / fps
+                if timestamp < last_time:
+                    raise ValueError("Media timestamps moved backwards")
+                last_time = timestamp
             if first_frame is None:
                 first_frame = frame.copy()
-            raw_pts = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000
-            timestamp = raw_pts if raw_pts > last_time else frame_id / fps
-            if timestamp < last_time:
-                raise ValueError("Media timestamps moved backwards")
-            last_time = timestamp
             entry: dict[str, Any] | None = None
             executed_plan: object | None = None
             detector_images = 0
@@ -614,6 +815,15 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                 else:
                     tracks = [TrackedObject(**t) for t in entry["tracks"]]
                     tracking_ms = 0.
+            elif prepared is not None:
+                detections = list(prepared["detections"])
+                detector_stats = dict(prepared["detector_stats"])
+                inference_ms = float(prepared["inference_ms"])
+                detector_images = int(prepared["detector_images"])
+                scan_type = "reference"
+                t1 = time.perf_counter()
+                tracks = tracker.update(detections, frame, frame_id=frame_id)
+                tracking_ms = (time.perf_counter() - t1) * 1000
             else:
                 import torch
                 if motion_scheduler is not None:
@@ -658,11 +868,17 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                     str(getattr(executed_plan, "scan_type", "reference"))
                     if executed_plan is not None else "reference"
                 )
+                # profile_gpu=True inserts synchronize() for accurate per-stage GPU timing.
+                # Production runs keep profile_gpu=False (default) to preserve async GPU
+                # pipeline overlap.  A synchronize() per frame adds ~50-80ms blocking
+                # overhead on T4 and is never acceptable in a throughput benchmark.
                 t1 = time.perf_counter()
                 if scan_type == "reference":
-                    torch.cuda.synchronize()
+                    if profile_gpu:
+                        torch.cuda.synchronize()
                     detections = detector.detect(frame)
-                    torch.cuda.synchronize()
+                    if profile_gpu:
+                        torch.cuda.synchronize()
                     detector_images = (
                         int(detector.reference_image_count(width, height))
                         if callable(getattr(detector, "reference_image_count", None)) else 1
@@ -670,9 +886,11 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                 elif scan_type == "tiles":
                     region_detector = getattr(detector, "detect_regions", None)
                     if not callable(region_detector):
-                        torch.cuda.synchronize()
+                        if profile_gpu:
+                            torch.cuda.synchronize()
                         detections = detector.detect(frame)
-                        torch.cuda.synchronize()
+                        if profile_gpu:
+                            torch.cuda.synchronize()
                         detector_images = (
                             int(detector.reference_image_count(width, height))
                             if callable(getattr(detector, "reference_image_count", None)) else 1
@@ -685,9 +903,11 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                         )
                         scan_type = "reference"
                     else:
-                        torch.cuda.synchronize()
+                        if profile_gpu:
+                            torch.cuda.synchronize()
                         detections = region_detector(frame, executed_plan.selected_tiles)
-                        torch.cuda.synchronize()
+                        if profile_gpu:
+                            torch.cuda.synchronize()
                         detector_images = len(executed_plan.selected_tiles)
                 else:
                     detections = []
@@ -719,7 +939,17 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             )
             tracks = _label_track_coverage(tracks, plan, width, height)
             workload = _detector_workload(detector, config, frame.shape, plan)
-            if replay_cache is None:
+            if prepared is not None:
+                workload.update({
+                    "model_invocations": int(detector_stats.get("model_invocations") or 0),
+                    "inference_images": detector_images,
+                    "batch_size": int(detector_stats.get("batch_size") or 0),
+                    "source_batch_size": int(detector_stats.get("source_batch_size") or 1),
+                    "inference_batch_id": detector_stats.get("inference_batch_id"),
+                    "actual_tensor_shapes": detector_stats.get("actual_tensor_shapes", []),
+                    "sum_tensor_pixels": detector_stats.get("sum_tensor_pixels"),
+                })
+            elif replay_cache is None:
                 skipped = str(plan.get("scan_type")) == "skip"
                 workload["model_invocations"] = 0 if skipped else int(
                     workload.get("model_invocations") or 1
@@ -952,7 +1182,8 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                         for t in tracks if t.observed],
                 snapshot, tuple(config.analytics.zones), transformer, overlay,
                 people_count=len(tracks), processing_fps=0, latency_ms=inference_ms,
-                timestamp=timestamp)
+                timestamp=timestamp,
+                tracked_objects=tuple(track for track in tracks if track.observed))
             render_ms = (time.perf_counter() - t3) * 1000
             t4 = time.perf_counter()
             writer.write(rendered)
@@ -967,6 +1198,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                 detections=len(detections), tracks=len(tracks), decode_ms=decode_ms,
                                 inference_ms=inference_ms, tracking_ms=tracking_ms,
                                 model_predict_ms=detector_stats.get("model_predict_ms"),
+                                result_transfer_ms=detector_stats.get("result_transfer_ms"),
                                 postprocess_ms=detector_stats.get("postprocess_ms"),
                                 merge_ms=detector_stats.get("merge_ms"),
                                 motion_ms=plan.get("motion_ms"), planning_ms=plan.get("planning_ms"),
@@ -974,6 +1206,9 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                 scan_type=plan.get("scan_type"),
                                 model_invocations=workload.get("model_invocations"),
                                 inference_images=workload.get("inference_images"),
+                                source_batch_size=workload.get("source_batch_size", 1),
+                                detector_batch_size=workload.get("batch_size"),
+                                inference_batch_id=workload.get("inference_batch_id"),
                                 sum_tensor_pixels=workload.get("sum_tensor_pixels"),
                                 directional_analytics_ms=directional_ms,
                                 legacy_analytics_ms=legacy_ms, analytics_ms=analytics_ms,
@@ -1006,6 +1241,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             cache_writer.close()
         if rebuilt_cache_writer:
             rebuilt_cache_writer.close()
+    frame_loop_elapsed = time.perf_counter() - began
     if not frame_ids:
         raise RuntimeError("Clip has no decoded frames")
     if tracklet is not None:
@@ -1191,6 +1427,20 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         "code_fingerprint": code_hash,
         "motion_roi_enabled": motion_enabled,
         "motion_roi_shadow_mode": bool(getattr(motion_config, "shadow_mode", False)),
+        "profile_gpu": profile_gpu,
+        "phases": {
+            "detector_warmup_ms": round(detector_warmup_ms, 3),
+            "frame_loop_seconds": round(frame_loop_elapsed, 3),
+        },
+        "offline_batch": {
+            "source_batch_size_requested": requested_source_batch_size,
+            "source_batch_size_effective": effective_source_batch_size,
+            "max_detector_images_per_batch": int(
+                config.video.max_detector_images_per_batch
+            ),
+            "detector_images_per_reference_frame": detector_images_per_reference,
+            "fallback_reason": source_batch_fallback_reason,
+        },
         "versions": _package_versions(),
         "runtime": {"python_executable": sys.executable, "platform": platform.platform()},
         "diagnostic_sampling": {
@@ -1209,6 +1459,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         json.dumps(provenance, indent=2, ensure_ascii=True), encoding="utf-8"
     )
     elapsed = time.perf_counter() - began
+    artifact_finalize_seconds = max(0.0, elapsed - frame_loop_elapsed)
     def p50(field: str) -> float:
         values = [t[field] for t in timings if t.get(field) is not None]
         return round(float(np.percentile(values, 50)), 3) if values else 0.0
@@ -1238,6 +1489,8 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    decode_p50_ms=p50("decode_ms"), decode_p95_ms=p95("decode_ms"),
                    detector_model_p50_ms=p50("model_predict_ms"),
                    detector_model_p95_ms=p95("model_predict_ms"),
+                    detector_result_transfer_p50_ms=p50("result_transfer_ms"),
+                    detector_result_transfer_p95_ms=p95("result_transfer_ms"),
                    detector_postprocess_p50_ms=p50("postprocess_ms"),
                    detector_postprocess_p95_ms=p95("postprocess_ms"),
                    detector_merge_p50_ms=p50("merge_ms"),
@@ -1256,7 +1509,29 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                             for path in final_snapshot.paths],
                    polyline_jitter_px=None,
                    change_detection_delay_s=None,
-                   processing_fps=round(len(frame_ids)/elapsed, 3),
+                   processing_fps=round(len(frame_ids)/frame_loop_elapsed, 3),
+                   processing_seconds=round(frame_loop_elapsed, 3),
+                   artifact_finalize_seconds=round(artifact_finalize_seconds, 3),
+                   detector_warmup_ms=round(detector_warmup_ms, 3),
+                   source_batch_size_requested=requested_source_batch_size,
+                   source_batch_size_effective=effective_source_batch_size,
+                   max_detector_images_per_batch=int(
+                       config.video.max_detector_images_per_batch
+                   ),
+                   source_batch_fallback_reason=source_batch_fallback_reason,
+                   inference_batches_total=sum(
+                       int(row.get("model_invocations") or 0) for row in timings
+                   ),
+                    detector_invocations_total=sum(
+                        int(row.get("model_invocations") or 0) for row in timings
+                    ),
+                    detector_images_total=sum(
+                        int(row.get("inference_images") or 0) for row in timings
+                    ),
+                    detector_images_per_source_frame=round(
+                        sum(int(row.get("inference_images") or 0) for row in timings)
+                        / max(1, len(frame_ids)), 3
+                    ),
                    provenance_schema=PROVENANCE_SCHEMA,
                    config_hash=config_hash,
                    scheduler_fingerprint=scheduler_hash,
@@ -1287,7 +1562,19 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         encoding="utf-8",
     )
     manifest = dict(run_id=run_id, status="success", **{k: summary[k] for k in
-                     ("run_type", "engine", "device", "frames")},
+                     ("run_type", "engine", "device", "frames", "processing_fps",
+                      "processing_seconds", "artifact_finalize_seconds",
+                      "detector_warmup_ms",
+                      "source_batch_size_requested", "source_batch_size_effective",
+                      "max_detector_images_per_batch", "source_batch_fallback_reason",
+                      "inference_batches_total",
+                      "detector_invocations_total", "detector_images_total",
+                      "detector_images_per_source_frame",
+                      "inference_p50_ms", "inference_p95_ms", "tracking_p50_ms",
+                      "tracking_p95_ms", "analytics_p50_ms", "analytics_p95_ms",
+                      "render_p50_ms", "render_p95_ms", "encode_p50_ms",
+                      "encode_p95_ms", "detector_result_transfer_p50_ms",
+                      "detector_result_transfer_p95_ms")},
                      input_hash=input_hash, model_hash=model_hash, cache_key=key,
                      cache_schema=CACHE_SCHEMA,
                      provenance_schema=PROVENANCE_SCHEMA,
@@ -1323,13 +1610,17 @@ def main() -> None:
                         help="Re-run ByteTrack from cached detections without inference")
     parser.add_argument("--allow-cache-key-mismatch", action="store_true",
                         help="Audit-only: allow an old cache key when source/model hashes match")
+    parser.add_argument("--profile-gpu", action="store_true",
+                        help="Insert cuda.synchronize() around each inference for accurate per-stage "
+                             "GPU timing. Adds ~50-80ms/frame overhead; never use in throughput benchmarks.")
     args = parser.parse_args()
     print(json.dumps(run(args.input, args.output_dir, config_path=args.config, model_path=args.model,
                          start_seconds=args.start_seconds, duration_seconds=args.duration_seconds,
                          run_id=args.run_id, engine=args.engine, replay_cache=args.replay_cache,
                          input_hash=args.source_hash, model_hash=args.model_hash,
                          rebuild_tracks=args.rebuild_tracks,
-                         allow_cache_key_mismatch=args.allow_cache_key_mismatch)))
+                         allow_cache_key_mismatch=args.allow_cache_key_mismatch,
+                         profile_gpu=args.profile_gpu)))
 
 
 if __name__ == "__main__":

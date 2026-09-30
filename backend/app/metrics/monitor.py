@@ -26,6 +26,7 @@ class PerformanceMonitor:
                 "inference_ms",
                 "tracking_ms",
                 "analytics_ms",
+                "common_path_ms",
                 "render_ms",
                 "encoding_ms",
                 "e2e_latency_ms",
@@ -38,8 +39,9 @@ class PerformanceMonitor:
         result: FrameResult,
         *,
         analytics_ms: float,
-        render_ms: float,
-        encoding_ms: float,
+        common_path_ms: float = 0.0,
+        render_ms: float | None,
+        encoding_ms: float | None,
     ) -> None:
         completed = time.monotonic()
         with self._lock:
@@ -48,8 +50,11 @@ class PerformanceMonitor:
             self._stages["inference_ms"].append(result.inference_ms)
             self._stages["tracking_ms"].append(result.tracking_ms)
             self._stages["analytics_ms"].append(analytics_ms)
-            self._stages["render_ms"].append(render_ms)
-            self._stages["encoding_ms"].append(encoding_ms)
+            self._stages["common_path_ms"].append(common_path_ms)
+            if render_ms is not None:
+                self._stages["render_ms"].append(render_ms)
+            if encoding_ms is not None:
+                self._stages["encoding_ms"].append(encoding_ms)
             self._stages["e2e_latency_ms"].append(
                 max(0.0, (completed - result.packet.captured_monotonic) * 1000.0)
             )
@@ -84,6 +89,16 @@ class PerformanceMonitor:
                 "dropped_frames": pipeline.dropped_frames + analytics_dropped_frames,
                 "capture_dropped_frames": pipeline.dropped_frames,
                 "analytics_dropped_frames": analytics_dropped_frames,
+                # Extended P0 counters
+                "source_frames": pipeline.captured_frames,
+                "processed_frames": pipeline.processed_frames,
+                "detector_images_total": pipeline.detector_images,
+                "detector_images_per_source_frame": (
+                    round(pipeline.detector_images / max(1, pipeline.captured_frames), 3)
+                ),
+                "detector_images_per_processed_frame": (
+                    round(pipeline.detector_images / max(1, pipeline.processed_frames), 3)
+                ),
                 "cpu_percent": round(self._process.cpu_percent(interval=None), 2),
                 "ram_mb": round(self._process.memory_info().rss / (1024 * 1024), 2),
             }

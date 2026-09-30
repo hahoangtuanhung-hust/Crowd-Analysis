@@ -162,6 +162,34 @@ class UltralyticsPersonDetector:
         self._device = None if config.device == "auto" else config.device
         self._model: Any = YOLO(config.model)
         self._last_inference_stats: dict[str, Any] = {}
+        self.last_scheduler_decision: Any = None
+
+    def warmup(
+        self,
+        frame_width: int = 1280,
+        frame_height: int = 720,
+        warmup_passes: int = 2,
+        source_batch_size: int = 1,
+    ) -> None:
+        """Run the detector with a blank frame to trigger CUDA/TensorRT kernel
+        compilation and memory allocation before the processing loop begins.
+
+        Without warm-up, the first inference call incurs a one-time JIT
+        compilation spike of ~200-500ms on T4, which distorts FPS measurements
+        and can cause false queue overflows.  This eliminates that spike.
+
+        Args:
+            frame_width:  Width of the warm-up dummy frame (pixels).
+            frame_height: Height of the warm-up dummy frame (pixels).
+            warmup_passes: Number of blank inferences to run. ≥2 is recommended
+                so that the second pass benchmarks stable steady-state latency.
+        """
+        dummy = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+        for _ in range(max(1, warmup_passes)):
+            if source_batch_size > 1:
+                self.detect_batch([dummy] * source_batch_size)
+            else:
+                self.detect(dummy)
 
     @property
     def last_inference_stats(self) -> dict[str, Any]:
@@ -190,21 +218,27 @@ class UltralyticsPersonDetector:
             "verbose": False,
         }
         if self._config.precision == "fp16":
-            # Avoid passing the deprecated flag at all for FP32.  Older
-            # Ultralytics builds still require ``half=True`` for CUDA FP16.
-            prediction_options["half"] = True
+            # Ultralytics 8.4.116 maps the legacy half=True alias to this
+            # unified precision option and emits one warning per model call.
+            prediction_options["quantize"] = 16
         prediction_started = time.perf_counter()
         results = self._model.predict(**prediction_options)
         prediction_ms = (time.perf_counter() - prediction_started) * 1000
-        decode_started = time.perf_counter()
+        transfer_started = time.perf_counter()
         self._last_inference_stats = {
             "model_invocations": 1,
             "inference_images": len(frames),
             "batch_size": len(frames),
             "model_predict_ms": prediction_ms,
-            "postprocess_ms": (time.perf_counter() - decode_started) * 1000,
+            # Ultralytics predict() is a fused wrapper covering preprocess,
+            # forward and its internal postprocess.  Only result transfer and
+            # project-specific merge can be isolated accurately here.
+            "ultralytics_predict_ms": prediction_ms,
+            "result_transfer_ms": 0.0,
+            "postprocess_ms": 0.0,
             "merge_ms": 0.0,
             "actual_tensor_shapes": [list(frame.shape) for frame in frames],
+            "shape_source": "source_images_before_ultralytics_letterbox",
             "sum_tensor_pixels": int(sum(int(frame.shape[0] * frame.shape[1]) for frame in frames)),
             "padding_overhead_pixels": None,
             "workload_source": "measured_input_shapes",
@@ -233,6 +267,9 @@ class UltralyticsPersonDetector:
                     )
                 ]
             )
+        transfer_ms = (time.perf_counter() - transfer_started) * 1000
+        self._last_inference_stats["result_transfer_ms"] = transfer_ms
+        self._last_inference_stats["postprocess_ms"] = transfer_ms
         return batches
 
     @staticmethod
@@ -330,6 +367,71 @@ class UltralyticsPersonDetector:
             frame, inputs, metadata
         )
 
+    def detect_batch(
+        self,
+        frames: Sequence[NDArray[np.uint8]],
+    ) -> list[list[Detection]]:
+        """Detect an ordered batch of independent source frames in one model call.
+
+        Tile predictions are still merged independently per source frame, so a
+        box can never suppress a box belonging to another frame.  Callers must
+        apply tracking and analytics to the returned lists in source order.
+        """
+        source_frames = list(frames)
+        if not source_frames:
+            self._predict([])
+            return []
+        if not self._config.tiled_inference:
+            predictions = self._predict(source_frames)
+            outputs: list[list[Detection]] = []
+            for frame, detections in zip(source_frames, predictions, strict=True):
+                height, width = frame.shape[:2]
+                outputs.append([
+                    detection
+                    for detection in detections
+                    if not _in_ignore_region(
+                        detection,
+                        width=width,
+                        height=height,
+                        regions=self._config.ignore_regions,
+                    )
+                ])
+            return outputs
+
+        flat_inputs: list[NDArray[np.uint8]] = []
+        frame_metadata: list[list[tuple[int, int, int, int] | None]] = []
+        for frame in source_frames:
+            height, width = frame.shape[:2]
+            metadata: list[tuple[int, int, int, int] | None] = []
+            if self._config.tile_include_full_frame:
+                flat_inputs.append(frame)
+                metadata.append(None)
+            for x1, y1, x2, y2 in self.tile_regions(width, height):
+                flat_inputs.append(frame[y1:y2, x1:x2])
+                metadata.append((x1, y1, x2, y2))
+            frame_metadata.append(metadata)
+
+        flat_predictions = self._predict(flat_inputs)
+        outputs = []
+        offset = 0
+        total_merge_ms = 0.0
+        for frame, metadata in zip(source_frames, frame_metadata, strict=True):
+            count = len(metadata)
+            outputs.append(self._merge_prediction_results(
+                frame,
+                flat_predictions[offset:offset + count],
+                metadata,
+            ))
+            total_merge_ms += float(self._last_inference_stats.get("merge_ms") or 0.0)
+            offset += count
+        self._last_inference_stats["merge_ms"] = total_merge_ms
+        self._last_inference_stats["postprocess_ms"] = (
+            float(self._last_inference_stats.get("result_transfer_ms") or 0.0)
+            + total_merge_ms
+        )
+        self._last_inference_stats["source_batch_size"] = len(source_frames)
+        return outputs
+
     def detect_regions(
         self,
         frame: NDArray[np.uint8],
@@ -360,8 +462,16 @@ class UltralyticsPersonDetector:
         inputs: list[NDArray[np.uint8]],
         metadata: list[tuple[int, int, int, int] | None],
     ) -> list[Detection]:
-        height, width = frame.shape[:2]
         prediction_batches = self._predict(inputs)
+        return self._merge_prediction_results(frame, prediction_batches, metadata)
+
+    def _merge_prediction_results(
+        self,
+        frame: NDArray[np.uint8],
+        prediction_batches: Sequence[list[Detection]],
+        metadata: Sequence[tuple[int, int, int, int] | None],
+    ) -> list[Detection]:
+        height, width = frame.shape[:2]
         merge_started = time.perf_counter()
 
         candidates: list[Detection] = []
@@ -404,32 +514,23 @@ class UltralyticsPersonDetector:
                 )
                 candidate_sources.append(source_id)
 
-        filtered = [
-            detection
-            for detection in candidates
-            if not _in_ignore_region(
+        filtered: list[Detection] = []
+        filtered_sources: list[int] = []
+        for detection, source_id in zip(candidates, candidate_sources, strict=True):
+            if _in_ignore_region(
                 detection,
                 width=width,
                 height=height,
                 regions=self._config.ignore_regions,
-            )
-        ]
+            ):
+                continue
+            filtered.append(detection)
+            filtered_sources.append(source_id)
         merged = _merge_detections(
             filtered,
             iou_threshold=self._config.tile_merge_iou,
             max_detections=self._config.max_det,
-            source_ids=[
-                source_id
-                for detection, source_id in zip(
-                    candidates, candidate_sources, strict=True
-                )
-                if not _in_ignore_region(
-                    detection,
-                    width=width,
-                    height=height,
-                    regions=self._config.ignore_regions,
-                )
-            ],
+            source_ids=filtered_sources,
         )
         self._last_inference_stats["merge_ms"] = (time.perf_counter() - merge_started) * 1000
         self._last_inference_stats["postprocess_ms"] = (

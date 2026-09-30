@@ -101,6 +101,33 @@ def test_pipeline_passes_frame_packet_to_cache_detector(tmp_path: Path) -> None:
     assert pipeline.join(timeout=10.0)
     assert pipeline.stats.error is None
     assert detector.frame_ids == [0, 1, 2]
+    assert pipeline.stats.detector_images == 0
+
+
+def test_pipeline_counts_all_images_in_tiled_reference_pass(tmp_path: Path) -> None:
+    video_path = tmp_path / "tiled.mp4"
+    make_video(video_path, frame_count=3)
+
+    class TiledDetector(FixedDetector):
+        @staticmethod
+        def reference_image_count(_width: int, _height: int) -> int:
+            return 5
+
+    results: list[FrameResult] = []
+    pipeline = TrackingPipeline(
+        OpenCVVideoSource(video_path),
+        TiledDetector(),
+        ByteTrackTracker(TrackerConfig()),
+        queue_size=2,
+        drop_oldest=False,
+        on_result=results.append,
+    )
+
+    pipeline.start()
+
+    assert pipeline.join(timeout=10.0)
+    assert pipeline.stats.detector_images == 15
+    assert [result.detector_images for result in results] == [5, 5, 5]
 
 
 def test_latest_queue_drops_oldest() -> None:
@@ -251,3 +278,35 @@ def test_processing_session_runs_directional_grid_with_camera_id(tmp_path: Path)
         point.frame_id == session.snapshot().frame_id
         for point in session.current_points()
     )
+
+
+def test_realtime_session_coalesces_stale_preview_without_dropping_analytics(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "realtime-preview.mp4"
+    make_video(video_path, frame_count=20)
+    config = AppConfig(
+        video=VideoConfig(queue_size=20, analytics_queue_size=20),
+    )
+    session = ProcessingSession(
+        camera_id="realtime-camera",
+        source_uri=str(video_path),
+        source_kind="upload",
+        realtime=True,
+        detector=FixedDetector(),
+        config=config,
+    )
+    original = session.renderer.render
+
+    def slow_render(*args, **kwargs):
+        time.sleep(0.15)
+        return original(*args, **kwargs)
+
+    session.renderer.render = slow_render  # type: ignore[method-assign]
+    session.start()
+
+    assert session.wait(timeout=10.0)
+    metrics = session.metrics()
+    assert session.pipeline.stats.processed_frames > 0
+    assert metrics["preview_skipped_frames"] > 0
+    assert session.snapshot().frame_id == session.pipeline.stats.processed_frames - 1
