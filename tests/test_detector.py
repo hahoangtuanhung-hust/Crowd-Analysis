@@ -19,6 +19,45 @@ def test_tile_ranges_cover_axis_with_overlap() -> None:
     assert ranges[0][1] > ranges[1][0]
 
 
+def test_normalized_far_tiles_reuse_existing_coordinate_mapping() -> None:
+    detector = object.__new__(UltralyticsPersonDetector)
+    detector._config = DetectorConfig(
+        tiled_inference=True,
+        tile_include_full_frame=True,
+        tile_regions_normalized=[
+            (0.0, 0.0, 0.55625, 0.555556),
+            (0.44375, 0.0, 1.0, 0.555556),
+        ],
+    )
+
+    assert detector.tile_regions(1280, 720) == (
+        (0, 0, 712, 400),
+        (568, 0, 1280, 400),
+    )
+    assert detector.reference_image_count(1280, 720) == 3
+
+
+def test_far_tile_source_batch_prepares_six_images_for_b2() -> None:
+    detector = object.__new__(UltralyticsPersonDetector)
+    detector._config = DetectorConfig(
+        tiled_inference=True,
+        tile_include_full_frame=True,
+        tile_regions_normalized=[
+            (0.0, 0.0, 0.55625, 0.555556),
+            (0.44375, 0.0, 1.0, 0.555556),
+        ],
+    )
+    frames = [np.zeros((720, 1280, 3), dtype=np.uint8) for _ in range(2)]
+
+    inputs, metadata, _ = detector.prepare_source_batch(frames)
+
+    assert len(inputs) == 6
+    assert metadata == [
+        [None, (0, 0, 712, 400), (568, 0, 1280, 400)],
+        [None, (0, 0, 712, 400), (568, 0, 1280, 400)],
+    ]
+
+
 def test_merge_detections_suppresses_tile_duplicates() -> None:
     detections = [
         Detection(0, 0, 20, 40, 0.9),
@@ -136,6 +175,31 @@ def test_normalized_ignore_region_filters_screen_detection() -> None:
         width=1280,
         height=720,
         regions=[(0.4, 0.05, 0.6, 0.25)],
+    )
+
+
+def test_candidate_can_keep_low_confidence_person_at_internal_tile_edge() -> None:
+    detection = Detection(1, 20, 9, 45, 0.05)
+
+    assert UltralyticsPersonDetector._keep_tile_detection(
+        detection,
+        tile_width=100,
+        tile_height=80,
+        left_internal=True,
+        top_internal=False,
+        right_internal=False,
+        bottom_internal=False,
+        edge_min_confidence=0.04,
+    )
+    assert not UltralyticsPersonDetector._keep_tile_detection(
+        detection,
+        tile_width=100,
+        tile_height=80,
+        left_internal=True,
+        top_internal=False,
+        right_internal=False,
+        bottom_internal=False,
+        edge_min_confidence=0.12,
     )
 
 

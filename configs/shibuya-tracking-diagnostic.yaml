@@ -1,0 +1,8 @@
+extends: shibuya-tracking-stable.yaml
+
+# One-frame, bounded association sample for a focused cache investigation.
+# Keep it separate from the candidate profile; production runs remain silent.
+tracker:
+  association_debug: true
+  association_debug_max_events: 200
+  association_debug_frame_ids: [100]

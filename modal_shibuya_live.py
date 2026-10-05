@@ -31,6 +31,10 @@ image = (
     .add_local_file("scripts/live_common_path.py", remote_path="/root/scripts/live_common_path.py")
     .add_local_file("scripts/__init__.py", remote_path="/root/scripts/__init__.py")
     .add_local_file("configs/shibuya.yaml", remote_path="/root/configs/shibuya.yaml")
+    .add_local_file(
+        "configs/shibuya-tracking-stable.yaml",
+        remote_path="/root/configs/shibuya-tracking-stable.yaml",
+    )
     .add_local_file("yolo26n.pt", remote_path="/root/model/yolo26n.pt")
 )
 
@@ -68,7 +72,7 @@ def live_api():
     token_fingerprint = hashlib.sha256(token.encode()).hexdigest()[:12] if token else None
     source = Path(f"/root/data/common_path/inputs/{SOURCE_HASH}.mp4")
     model = Path("/root/model/yolo26n.pt")
-    config = Path("/root/configs/shibuya.yaml")
+    config = Path("/root/configs/shibuya-tracking-stable.yaml")
     pipeline_lock = asyncio.Lock()
 
     async def send_json(send, payload: dict[str, object]) -> None:

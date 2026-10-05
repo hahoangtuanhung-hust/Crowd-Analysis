@@ -1,0 +1,20 @@
+extends: shibuya.yaml
+
+video:
+  inference_interval: 3
+
+detector:
+  tiled_inference: false
+  
+  perspective_regions:
+    enabled: true
+    strategy: full_frame_plus_far
+    far:
+      y_min: 0.0
+      y_max: 0.38
+      imgsz: 960
+      tiles:
+        rows: 1
+        cols: 2
+      upscale:
+        enabled: false

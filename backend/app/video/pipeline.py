@@ -30,6 +30,23 @@ class PipelineStats:
     roi_scans: int = 0
     intentionally_skipped_scans: int = 0
     detector_images: int = 0
+    # Sampled detection metrics
+    policy_skipped_frames: int = 0
+    association_updates: int = 0
+    prediction_steps: int = 0
+    detection_scan_deadline_misses: int = 0
+    detector_images_total: int = 0
+    detector_images_far: int = 0
+    detector_images_middle: int = 0
+    detector_images_near: int = 0
+    detector_images_full: int = 0
+    detections_far_raw: int = 0
+    detections_middle_raw: int = 0
+    detections_near_raw: int = 0
+    detections_after_merge: int = 0
+    perspective_preprocess_ms: float = 0.0
+    perspective_detector_ms: float = 0.0
+    perspective_merge_ms: float = 0.0
 
 
 class TrackingPipeline:
@@ -77,6 +94,28 @@ class TrackingPipeline:
         self._roi_scans = 0
         self._intentionally_skipped_scans = 0
         self._detector_images = 0
+        self._policy_skipped_frames = 0
+        self._association_updates = 0
+        self._prediction_steps = 0
+        self._detection_scan_deadline_misses = 0
+        self._detector_images_total = 0
+        self._detector_images_far = 0
+        self._detector_images_middle = 0
+        self._detector_images_near = 0
+        self._detector_images_full = 0
+        self._detections_far_raw = 0
+        self._detections_middle_raw = 0
+        self._detections_near_raw = 0
+        self._detections_after_merge = 0
+        self._perspective_preprocess_ms = 0.0
+        self._perspective_detector_ms = 0.0
+        self._perspective_merge_ms = 0.0
+        # Deadline-based detection scheduler state
+        # Tracks the source frame_id of the last detection scan so we use
+        # "frames since last scan >= N" rather than frame_id % N == 0.
+        # This handles live frame drops: if frame 5 was dropped, frame 6
+        # is detected on schedule instead of waiting until frame 10.
+        self._last_detection_frame_id: int | None = None
 
     @property
     def stats(self) -> PipelineStats:
@@ -91,7 +130,50 @@ class TrackingPipeline:
             roi_scans=self._roi_scans,
             intentionally_skipped_scans=self._intentionally_skipped_scans,
             detector_images=self._detector_images,
+            policy_skipped_frames=self._policy_skipped_frames,
+            association_updates=self._association_updates,
+            prediction_steps=self._prediction_steps,
+            detection_scan_deadline_misses=self._detection_scan_deadline_misses,
+            detector_images_total=self._detector_images_total,
+            detector_images_far=self._detector_images_far,
+            detector_images_middle=self._detector_images_middle,
+            detector_images_near=self._detector_images_near,
+            detector_images_full=self._detector_images_full,
+            detections_far_raw=self._detections_far_raw,
+            detections_middle_raw=self._detections_middle_raw,
+            detections_near_raw=self._detections_near_raw,
+            detections_after_merge=self._detections_after_merge,
+            perspective_preprocess_ms=self._perspective_preprocess_ms,
+            perspective_detector_ms=self._perspective_detector_ms,
+            perspective_merge_ms=self._perspective_merge_ms,
         )
+
+    def _is_detection_frame(self, frame_id: int) -> bool:
+        """Deadline-based detection scheduler.
+
+        Instead of ``frame_id % N == 0`` (which misses the schedule when
+        exactly that frame is dropped from the live queue), we trigger
+        detection on the first frame that is *at least N source frames* away
+        from the last detection scan.  The schedule is updated from the
+        actual scanned frame so subsequent deadlines stay correctly spaced.
+
+        On the very first frame of an epoch the scheduler always detects.
+        """
+        if self.inference_interval <= 1:
+            return True
+        if self._last_detection_frame_id is None:
+            # First frame of epoch — always detect
+            return True
+        gap = frame_id - self._last_detection_frame_id
+        if gap < 0:
+            # frame_id went backwards (epoch reset) — detect to resync
+            return True
+        if gap >= self.inference_interval:
+            if gap > self.inference_interval:
+                # The exact deadline frame was dropped; we're running late
+                self._detection_scan_deadline_misses += 1
+            return True
+        return False
 
     def start(self) -> None:
         if self._capture_thread is not None and self._capture_thread.is_alive():
@@ -107,6 +189,11 @@ class TrackingPipeline:
         self._roi_scans = 0
         self._intentionally_skipped_scans = 0
         self._detector_images = 0
+        self._policy_skipped_frames = 0
+        self._association_updates = 0
+        self._prediction_steps = 0
+        self._detection_scan_deadline_misses = 0
+        self._last_detection_frame_id = None
         self.source.open()
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -115,8 +202,11 @@ class TrackingPipeline:
         )
         self._processing_thread = threading.Thread(
             target=self._processing_loop,
-            name=("cache-replay-worker" if callable(getattr(self.detector, "detect_packet", None))
-                  else "inference-worker"),
+            name=(
+                "cache-replay-worker"
+                if callable(getattr(self.detector, "detect_packet", None))
+                else "inference-worker"
+            ),
             daemon=True,
         )
         self._processing_thread.start()
@@ -194,8 +284,51 @@ class TrackingPipeline:
                 if item is _END:
                     break
                 assert isinstance(item, FramePacket)
-                if item.frame_id % self.inference_interval != 0:
+
+                # --- Sampled detection scheduler ---
+                # Use deadline-based logic instead of modulo so live frame
+                # drops do not permanently stall the detection schedule.
+                run_detection = self._is_detection_frame(item.frame_id)
+                if not run_detection:
+                    # Coast: advance Kalman predictions without running YOLO.
+                    # This keeps bbox positions reasonable for preview and
+                    # ensures the state advances correctly before the next
+                    # real measurement update (no double-predict).
+                    coast_fn = getattr(self.tracker, "coast", None)
+                    if callable(coast_fn):
+                        coast_tracks = coast_fn(
+                            item.image,
+                            frame_id=item.frame_id,
+                            source_timestamp=item.source_timestamp,
+                        )
+                        self._prediction_steps += 1
+                        self._policy_skipped_frames += 1
+                        # Emit a coast result so downstream gets state/preview.
+                        # observed=False / NOT_SEARCHED_BY_POLICY — these
+                        # points must NOT create Common Path evidence.
+                        coast_result = FrameResult(
+                            packet=item,
+                            detections=(),
+                            tracks=tuple(coast_tracks),
+                            inference_ms=0.0,
+                            tracking_ms=0.0,
+                            processing_completed_monotonic=time.monotonic(),
+                            observation_mode="NOT_SEARCHED_BY_POLICY",
+                            searched_regions=(),
+                            scheduler_state="CADENCE_SKIP",
+                            scheduler_reasons=("cadence_skip",),
+                            detector_images=0,
+                            intentional_skip=True,
+                        )
+                        self._processed_frames += 1
+                        if self.on_result is not None:
+                            self.on_result(coast_result)
+                    # If tracker has no coast method, silently skip (N=1 only
+                    # reaches here if inference_interval==1, which is guarded).
                     continue
+
+                # This is a detection frame — record it for the deadline scheduler.
+                self._last_detection_frame_id = item.frame_id
 
                 packet_detector = getattr(self.detector, "detect_packet", None)
                 if callable(packet_detector) or self.motion_scheduler is None:
@@ -211,12 +344,16 @@ class TrackingPipeline:
                         detections,
                         item.image,
                         frame_id=item.frame_id,
+                        source_timestamp=item.source_timestamp,
                     )
                     tracking_ms = (time.perf_counter() - tracking_started) * 1000.0
+                    self._association_updates += 1
                     height, width = item.image.shape[:2]
                     observation_mode = "FULL_COVERAGE"
                     searched_regions = ((0, 0, width, height),)
-                    scheduler_state = "DISABLED" if self.motion_scheduler is None else "CACHE_REPLAY"
+                    scheduler_state = (
+                        "DISABLED" if self.motion_scheduler is None else "CACHE_REPLAY"
+                    )
                     scheduler_reasons: tuple[str, ...] = ()
                     motion_ms = 0.0
                     planning_ms = 0.0
@@ -227,9 +364,7 @@ class TrackingPipeline:
                     if callable(packet_detector):
                         detector_images = 0
                     else:
-                        image_count_provider = getattr(
-                            self.detector, "reference_image_count", None
-                        )
+                        image_count_provider = getattr(self.detector, "reference_image_count", None)
                         detector_images = (
                             int(image_count_provider(width, height))
                             if callable(image_count_provider)
@@ -279,6 +414,21 @@ class TrackingPipeline:
                     detector_images=detector_images,
                     intentional_skip=intentional_skip,
                 )
+
+                det_stats = getattr(self.detector, "last_inference_stats", {}) or {}
+                self._detector_images_total += det_stats.get("detector_images_total", 0)
+                self._detector_images_far += det_stats.get("detector_images_far", 0)
+                self._detector_images_middle += det_stats.get("detector_images_middle", 0)
+                self._detector_images_near += det_stats.get("detector_images_near", 0)
+                self._detector_images_full += det_stats.get("detector_images_full", 0)
+                self._detections_far_raw += det_stats.get("detections_far_raw", 0)
+                self._detections_middle_raw += det_stats.get("detections_middle_raw", 0)
+                self._detections_near_raw += det_stats.get("detections_near_raw", 0)
+                self._detections_after_merge += det_stats.get("detections_after_merge", 0)
+                self._perspective_preprocess_ms += det_stats.get("perspective_preprocess_ms", 0.0)
+                self._perspective_detector_ms += det_stats.get("perspective_detector_ms", 0.0)
+                self._perspective_merge_ms += det_stats.get("perspective_merge_ms", 0.0)
+
                 self._processed_frames += 1
                 if self.on_result is not None:
                     self.on_result(result)
@@ -296,14 +446,10 @@ class TrackingPipeline:
         assert self.motion_scheduler is not None
         height, width = item.image.shape[:2]
         tile_provider = getattr(self.detector, "tile_regions", None)
-        tile_regions = (
-            tuple(tile_provider(width, height)) if callable(tile_provider) else ()
-        )
+        tile_regions = tuple(tile_provider(width, height)) if callable(tile_provider) else ()
         image_count_provider = getattr(self.detector, "reference_image_count", None)
         reference_image_count = (
-            int(image_count_provider(width, height))
-            if callable(image_count_provider)
-            else 1
+            int(image_count_provider(width, height)) if callable(image_count_provider) else 1
         )
         plan = self.motion_scheduler.plan(
             item.image,
@@ -361,18 +507,25 @@ class TrackingPipeline:
 
         tracking_started = time.perf_counter()
         if plan.scan_type == "skip":
-            coast = getattr(self.tracker, "coast", None)
-            if not callable(coast):
+            coast_fn = getattr(self.tracker, "coast", None)
+            if not callable(coast_fn):
                 raise RuntimeError(
                     "motion ROI skip requires tracker.coast; refusing update([]) semantics"
                 )
-            tracks = coast(item.image, frame_id=item.frame_id)
+            tracks = coast_fn(
+                item.image,
+                frame_id=item.frame_id,
+                source_timestamp=item.source_timestamp,
+            )
+            self._prediction_steps += 1
         else:
             tracks = self.tracker.update(
                 detections,
                 item.image,
                 frame_id=item.frame_id,
+                source_timestamp=item.source_timestamp,
             )
+            self._association_updates += 1
         tracking_ms = (time.perf_counter() - tracking_started) * 1000.0
         return detections, tracks, inference_ms, tracking_ms, plan, detector_images
 
@@ -385,9 +538,7 @@ class TrackingPipeline:
             elif observation_mode == "NOT_SEARCHED_BY_POLICY":
                 coverage = "NOT_SEARCHED_BY_POLICY"
             else:
-                searched = TrackingPipeline._box_fully_covered(
-                    track.xyxy, searched_regions
-                )
+                searched = TrackingPipeline._box_fully_covered(track.xyxy, searched_regions)
                 coverage = "SEARCHED_NOT_FOUND" if searched else "NOT_SEARCHED_BY_POLICY"
             labeled.append(replace(track, observation_coverage=coverage))
         return labeled
@@ -410,9 +561,7 @@ class TrackingPipeline:
         covered = 0.0
         for left, right in zip(xs, xs[1:]):
             intervals = sorted(
-                (top, bottom)
-                for x1, top, x2, bottom in clipped
-                if x1 < right and x2 > left
+                (top, bottom) for x1, top, x2, bottom in clipped if x1 < right and x2 > left
             )
             if not intervals:
                 continue

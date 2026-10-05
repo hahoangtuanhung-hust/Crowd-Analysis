@@ -1,0 +1,19 @@
+extends: shibuya-overlap-batch2.yaml
+
+# ============================================================
+# Profile: Sampled Detection N=3
+# Detector runs every 3rd source frame; intermediate frames
+# call coast() to advance Kalman state without YOLO.
+#
+# Semantics (see pipeline._is_detection_frame):
+#   - inference_interval = N = distance between detection scans
+#   - Frame 0 always detected (epoch start)
+#   - Next detection when: current_frame_id - last_detected_frame_id >= N
+#   - Live queue drops are handled gracefully (deadline-based scheduler)
+#
+# Source 30 FPS  -> ~10 detection scans/sec -> ~50 detector images/sec (5 tiles)
+# Rollback: use configs/shibuya-overlap-batch2.yaml (inference_interval=1)
+# ============================================================
+
+video:
+  inference_interval: 3

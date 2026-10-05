@@ -12,6 +12,7 @@ ObservationCoverage = Literal[
     "SEARCHED_NOT_FOUND",
     "NOT_SEARCHED_BY_POLICY",
 ]
+DirectionState = Literal["unknown", "stationary", "moving"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,10 @@ class TrackedObject:
     class_id: int = 0
     observed: bool = True
     observation_coverage: ObservationCoverage = "MEASURED"
+    direction_vector: tuple[float, float] | None = None
+    direction_state: DirectionState = "unknown"
+    direction_quality: float = 0.0
+    direction_observed_span_s: float = 0.0
 
     @property
     def xyxy(self) -> tuple[float, float, float, float]:

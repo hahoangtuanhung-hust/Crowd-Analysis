@@ -11,6 +11,40 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PerspectiveTileConfig(StrictModel):
+    rows: int = Field(default=1, ge=1, le=4)
+    cols: int = Field(default=1, ge=1, le=4)
+    overlap: float = Field(default=0.2, ge=0.0, lt=0.5)
+
+
+class PerspectiveUpscaleConfig(StrictModel):
+    enabled: bool = False
+    scale: float = Field(default=2.0, ge=1.0, le=4.0)
+    interpolation: Literal["linear", "cubic", "lanczos"] = "lanczos"
+
+
+class PerspectiveRegion(StrictModel):
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0)
+    tiles: PerspectiveTileConfig = Field(default_factory=PerspectiveTileConfig)
+    imgsz: int = Field(default=640, ge=32)
+    upscale: PerspectiveUpscaleConfig = Field(default_factory=PerspectiveUpscaleConfig)
+
+    @model_validator(mode="after")
+    def validate_y(self) -> PerspectiveRegion:
+        if self.y_min >= self.y_max:
+            raise ValueError("y_min must be strictly less than y_max")
+        return self
+
+
+class PerspectiveRegionsConfig(StrictModel):
+    enabled: bool = False
+    strategy: Literal["full_frame_plus_far", "region_only"] = "full_frame_plus_far"
+    far: PerspectiveRegion = Field(default_factory=PerspectiveRegion)
+    middle: PerspectiveRegion = Field(default_factory=PerspectiveRegion)
+    near: PerspectiveRegion = Field(default_factory=PerspectiveRegion)
+
+
 class DetectorConfig(StrictModel):
     provider: Literal["ultralytics"] = "ultralytics"
     model: str = "yolo26n.pt"
@@ -26,16 +60,35 @@ class DetectorConfig(StrictModel):
     tile_columns: int = Field(default=2, ge=1, le=4)
     tile_overlap: float = Field(default=0.2, ge=0.0, lt=0.5)
     tile_merge_iou: float = Field(default=0.45, gt=0.0, le=1.0)
+    # Weak boxes touching an internal tile edge are more likely to be crop
+    # artifacts.  Keep this independent from the detector floor so a tuned
+    # profile can preserve weak, but still useful, seam observations.
+    tile_edge_min_confidence: float = Field(default=0.12, ge=0.0, le=1.0)
     tile_include_full_frame: bool = True
+    # Optional fixed crop geometry. Coordinates are normalized so the same
+    # camera policy scales with the decoded frame instead of embedding pixels.
+    # Empty preserves the historical rows x columns grid exactly.
+    tile_regions_normalized: list[tuple[float, float, float, float]] = Field(
+        default_factory=list
+    )
     ignore_regions: list[tuple[float, float, float, float]] = Field(default_factory=list)
+    perspective_regions: PerspectiveRegionsConfig = Field(default_factory=PerspectiveRegionsConfig)
 
     @model_validator(mode="after")
-    def validate_ignore_regions(self) -> DetectorConfig:
-        for x1, y1, x2, y2 in self.ignore_regions:
-            if not all(0.0 <= value <= 1.0 for value in (x1, y1, x2, y2)):
-                raise ValueError("detector ignore_regions coordinates must be normalized")
-            if x1 >= x2 or y1 >= y2:
-                raise ValueError("detector ignore_regions must use x1 < x2 and y1 < y2")
+    def validate_normalized_regions(self) -> DetectorConfig:
+        for field_name, regions in (
+            ("tile_regions_normalized", self.tile_regions_normalized),
+            ("ignore_regions", self.ignore_regions),
+        ):
+            for x1, y1, x2, y2 in regions:
+                if not all(0.0 <= value <= 1.0 for value in (x1, y1, x2, y2)):
+                    raise ValueError(
+                        f"detector {field_name} coordinates must be normalized"
+                    )
+                if x1 >= x2 or y1 >= y2:
+                    raise ValueError(
+                        f"detector {field_name} must use x1 < x2 and y1 < y2"
+                    )
         return self
 
 
@@ -57,6 +110,35 @@ class TrackerConfig(StrictModel):
     motion_cost_weight: float = Field(default=0.35, ge=0.0, le=1.0)
     motion_direction_penalty: float = Field(default=0.20, ge=0.0, le=1.0)
     motion_history_alpha: float = Field(default=0.65, gt=0.0, le=1.0)
+    # The reference profile keeps the historical frame-diagonal gate.  A
+    # candidate can opt into this size-aware, uncertainty-bounded gate without
+    # changing all existing camera profiles at once.
+    association_size_adaptive: bool = False
+    association_distance_floor_pixels: float = Field(default=10.0, gt=0.0)
+    association_distance_height_ratio: float = Field(default=1.5, gt=0.0)
+    association_max_distance_pixels: float = Field(default=96.0, gt=0.0)
+    association_time_gap_growth: float = Field(default=0.25, ge=0.0, le=3.0)
+    association_uncertainty_weight: float = Field(default=0.0, ge=0.0, le=5.0)
+    association_max_uncertainty_pixels: float = Field(default=18.0, ge=0.0)
+    association_hard_gate: bool = False
+    # Direction is diagnostic tracker output only.  It is estimated from
+    # observed source-time measurements and never changes Common Path input.
+    direction_diagnostics_enabled: bool = False
+    direction_history_seconds: float = Field(default=1.0, gt=0.0, le=10.0)
+    direction_max_observation_gap_seconds: float = Field(default=0.5, gt=0.0)
+    direction_min_observations: int = Field(default=3, ge=2, le=120)
+    direction_min_observed_span_seconds: float = Field(default=0.15, gt=0.0)
+    direction_min_displacement_pixels: float = Field(default=2.0, ge=0.0)
+    direction_stationary_enter_speed_pixels_s: float = Field(default=4.0, ge=0.0)
+    direction_stationary_exit_speed_pixels_s: float = Field(default=6.0, ge=0.0)
+    direction_fallback_fps: float = Field(default=30.0, gt=0.0, le=240.0)
+    # Association diagnostics are bounded and disabled by default.  Optional
+    # frame/track filters keep an investigation from logging a cost matrix for
+    # every person in a production stream.
+    association_debug: bool = False
+    association_debug_max_events: int = Field(default=250, ge=1, le=10_000)
+    association_debug_track_ids: list[int] = Field(default_factory=list)
+    association_debug_frame_ids: list[int] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_threshold_order(self) -> TrackerConfig:
@@ -64,6 +146,28 @@ class TrackerConfig(StrictModel):
             raise ValueError("track_low_thresh must not exceed track_high_thresh")
         if self.new_track_thresh < self.track_high_thresh:
             raise ValueError("new_track_thresh must not be below track_high_thresh")
+        if self.association_max_distance_pixels < self.association_distance_floor_pixels:
+            raise ValueError(
+                "association_max_distance_pixels must not be below "
+                "association_distance_floor_pixels"
+            )
+        if (
+            self.direction_stationary_exit_speed_pixels_s
+            < self.direction_stationary_enter_speed_pixels_s
+        ):
+            raise ValueError(
+                "direction_stationary_exit_speed_pixels_s must not be below "
+                "direction_stationary_enter_speed_pixels_s"
+            )
+        if self.direction_min_observed_span_seconds > self.direction_history_seconds:
+            raise ValueError(
+                "direction_min_observed_span_seconds must not exceed "
+                "direction_history_seconds"
+            )
+        if any(value < 0 for value in self.association_debug_track_ids):
+            raise ValueError("association_debug_track_ids must be non-negative")
+        if any(value < 0 for value in self.association_debug_frame_ids):
+            raise ValueError("association_debug_frame_ids must be non-negative")
         if (
             self.stationary_lost_track_grace_frames is not None
             and self.stationary_lost_track_grace_frames < self.lost_track_grace_frames
@@ -160,6 +264,9 @@ class VideoConfig(StrictModel):
     # to process one source frame at a time to preserve its latency contract.
     source_batch_size: int = Field(default=1, ge=1, le=16)
     max_detector_images_per_batch: int = Field(default=20, ge=1, le=80)
+    offline_overlap_enabled: bool = False
+    offline_overlap_queue_batches: int = Field(default=2, ge=1, le=8)
+    detector_worker_mode: Literal["baseline", "no_sync_profile"] = "baseline"
     queue_size: int = Field(default=4, ge=1, le=128)
     analytics_queue_size: int = Field(default=1000, ge=1, le=100_000)
     stale_frame_policy: Literal["drop_oldest", "block"] = "drop_oldest"
@@ -487,7 +594,10 @@ class AppConfig(StrictModel):
                     "motion_roi requires detector.tiled_inference so ROI execution "
                     "can reuse the validated detector profile"
                 )
-            tile_count = self.detector.tile_rows * self.detector.tile_columns
+            tile_count = (
+                len(self.detector.tile_regions_normalized)
+                or self.detector.tile_rows * self.detector.tile_columns
+            )
             if self.motion_roi.roi.max_selected_tiles > tile_count:
                 raise ValueError(
                     "motion_roi.roi.max_selected_tiles must not exceed the detector tile count"

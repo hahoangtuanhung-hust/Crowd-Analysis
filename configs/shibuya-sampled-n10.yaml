@@ -1,0 +1,20 @@
+extends: shibuya.yaml
+
+# ============================================================
+# Profile: Sampled Detection N=10 (EXPERIMENTAL)
+# DO NOT promote to production without N=5 quality gate passing.
+#
+# Semantics: same deadline-based scheduler as N=3/N=5.
+# Source 30 FPS  -> ~3 detection scans/sec -> ~15 detector images/sec (5 tiles)
+#
+# Warning: At N=10 (333ms gap):
+#   - max_observation_gap (0.8s) still accommodates but with less margin
+#   - min_track_duration_seconds (0.35s) requires >= 2 observed scans
+#   - Short passages (<1s) of people passing through may be missed entirely
+#   - Direction estimation needs >= 2 observed points; hysteresis may fail
+#
+# Gate: only run N=10 benchmark if N=5 passes IDF1/tracking quality criteria.
+# ============================================================
+
+video:
+  inference_interval: 10

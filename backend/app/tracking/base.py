@@ -15,6 +15,7 @@ class MultiObjectTracker(Protocol):
         frame: NDArray,
         *,
         frame_id: int | None = None,
+        source_timestamp: float | None = None,
     ) -> list[TrackedObject]: ...
 
     def coast(
@@ -22,6 +23,7 @@ class MultiObjectTracker(Protocol):
         frame: NDArray,
         *,
         frame_id: int | None = None,
+        source_timestamp: float | None = None,
     ) -> list[TrackedObject]: ...
 
     def reset(self) -> None: ...

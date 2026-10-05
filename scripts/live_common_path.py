@@ -280,7 +280,12 @@ class LiveCommonPathProcessor:
                 detector_calls += 1
                 inference_ms = (time.perf_counter() - infer_started) * 1000
                 track_started = time.perf_counter()
-                tracks: list[TrackedObject] = tracker.update(detections, frame)
+                tracks: list[TrackedObject] = tracker.update(
+                    detections,
+                    frame,
+                    frame_id=source_frame_id,
+                    source_timestamp=media_s,
+                )
                 tracking_ms = (time.perf_counter() - track_started) * 1000
                 unique_tracks.update(track.track_id for track in tracks)
 

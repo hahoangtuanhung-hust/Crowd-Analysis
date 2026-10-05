@@ -1,0 +1,36 @@
+extends: shibuya.yaml
+
+detector:
+  # Giữ dải low-score cho ByteTrack recovery; track birth vẫn cần evidence
+  # high-score theo profile baseline.
+  confidence: 0.02
+  # Baseline chặn toàn bộ weak box chạm internal tile edge dưới 0.12. Hạ có
+  # kiểm soát để source-aware merge được nhìn thấy evidence ở tile seam.
+  tile_edge_min_confidence: 0.04
+
+tracker:
+  # Chỉ hạ low pool. Không hạ high/new threshold để low-confidence box không
+  # tự sinh nhiều identity mới khi chưa có benchmark false-birth.
+  track_high_thresh: 0.08
+  track_low_thresh: 0.02
+  new_track_thresh: 0.08
+  # Small boxes lose IoU after a few pixels. Use bottom-center geometry that
+  # scales with bbox height, has a pixel noise floor, and remains capped.
+  association_size_adaptive: true
+  association_distance_floor_pixels: 8.0
+  association_distance_height_ratio: 1.25
+  association_max_distance_pixels: 72.0
+  association_time_gap_growth: 0.25
+  association_uncertainty_weight: 0.35
+  association_max_uncertainty_pixels: 12.0
+  association_hard_gate: true
+  # Debug-only tracker output; Common Path still receives the unchanged raw,
+  # observed bottom-center point contract.
+  direction_diagnostics_enabled: true
+  direction_history_seconds: 0.8
+  direction_max_observation_gap_seconds: 0.35
+  direction_min_observations: 3
+  direction_min_observed_span_seconds: 0.20
+  direction_min_displacement_pixels: 1.5
+  direction_stationary_enter_speed_pixels_s: 3.0
+  direction_stationary_exit_speed_pixels_s: 5.0

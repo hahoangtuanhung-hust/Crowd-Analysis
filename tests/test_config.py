@@ -35,6 +35,23 @@ def test_shibuya_config_enables_small_person_detection() -> None:
     assert config.tracker.stationary_lost_track_grace_frames == 30
 
 
+def test_shibuya_far2_candidate_changes_only_normalized_tile_geometry() -> None:
+    baseline = load_config(Path("configs/shibuya-overlap-batch2.yaml"))
+    candidate = load_config(Path("configs/shibuya-overlap-batch2-far2.yaml"))
+
+    baseline_detector = baseline.detector.model_dump()
+    candidate_detector = candidate.detector.model_dump()
+    assert baseline_detector.pop("tile_regions_normalized") == []
+    assert candidate_detector.pop("tile_regions_normalized") == [
+        (0.0, 0.0, 0.55625, 0.555556),
+        (0.44375, 0.0, 1.0, 0.555556),
+    ]
+    assert candidate_detector == baseline_detector
+    assert candidate.video == baseline.video
+    assert candidate.tracker == baseline.tracker
+    assert candidate.analytics == baseline.analytics
+
+
 def test_shibuya_realtime_candidate_resolves_relative_parent() -> None:
     config = load_config(Path("configs/shibuya-realtime-candidate.yaml"))
 
@@ -44,6 +61,19 @@ def test_shibuya_realtime_candidate_resolves_relative_parent() -> None:
     assert config.video.source_batch_size == 2
     assert config.video.max_detector_images_per_batch == 10
     assert config.analytics.common_path.max_paths == 3
+
+
+def test_shibuya_tracking_stable_only_lowers_recovery_pool_and_enables_candidate_gates() -> None:
+    baseline = load_config(Path("configs/shibuya.yaml"))
+    candidate = load_config(Path("configs/shibuya-tracking-stable.yaml"))
+
+    assert candidate.detector.confidence == candidate.tracker.track_low_thresh == 0.02
+    assert candidate.detector.tile_edge_min_confidence == 0.04
+    assert candidate.tracker.track_high_thresh == baseline.tracker.track_high_thresh
+    assert candidate.tracker.new_track_thresh == baseline.tracker.new_track_thresh
+    assert candidate.tracker.association_size_adaptive is True
+    assert candidate.tracker.association_hard_gate is True
+    assert candidate.tracker.direction_diagnostics_enabled is True
 
 
 def test_shibuya_fp16_variants_keep_three_common_paths() -> None:
@@ -78,6 +108,24 @@ def test_tracker_rejects_inverted_thresholds() -> None:
 def test_tracker_rejects_shorter_stationary_grace_period() -> None:
     with pytest.raises(ValidationError, match="stationary_lost_track_grace_frames"):
         TrackerConfig(lost_track_grace_frames=4, stationary_lost_track_grace_frames=3)
+
+
+def test_tracker_rejects_invalid_adaptive_gate_and_direction_hysteresis() -> None:
+    with pytest.raises(ValidationError, match="association_max_distance_pixels"):
+        TrackerConfig(
+            association_distance_floor_pixels=20,
+            association_max_distance_pixels=10,
+        )
+    with pytest.raises(ValidationError, match="direction_stationary_exit"):
+        TrackerConfig(
+            direction_stationary_enter_speed_pixels_s=5,
+            direction_stationary_exit_speed_pixels_s=4,
+        )
+    with pytest.raises(ValidationError, match="direction_min_observed_span"):
+        TrackerConfig(
+            direction_history_seconds=0.1,
+            direction_min_observed_span_seconds=0.2,
+        )
 
 
 def test_detector_threshold_must_feed_bytetrack_low_confidence_stage() -> None:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import math
+import logging
+from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +13,33 @@ from numpy.typing import NDArray
 
 from backend.app.core.config import TrackerConfig
 from backend.app.schemas import Detection, TrackedObject
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _MotionState:
+    """Observed bottom-center motion in source-frame units."""
+
+    center: NDArray[np.float32]
+    velocity: NDArray[np.float32]
+    frame_id: int
+    quality: float
+
+
+@dataclass(slots=True)
+class _ObservedPoint:
+    frame_id: int
+    timestamp_s: float
+    center: NDArray[np.float32]
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectionEstimate:
+    vector: tuple[float, float] | None
+    state: str
+    quality: float
+    observed_span_s: float
 
 
 class _DetectionResults:
@@ -40,13 +70,15 @@ class ByteTrackTracker:
     def __init__(self, config: TrackerConfig) -> None:
         self._config = config
         self._frame_diagonal = 1.0
-        # Last observed bottom-center and velocity per ID.  ByteTrack's
-        # Kalman state is excellent for ordinary motion, but retaining this
-        # short history prevents an ID from jumping to the opposite person
-        # when two pedestrians overlap and the detector briefly drops one.
-        self._motion_by_track: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
+        self._motion_by_track: dict[int, _MotionState] = {}
+        self._observation_history: dict[int, list[_ObservedPoint]] = {}
+        self._direction_by_track: dict[int, _DirectionEstimate] = {}
         self._coast_misses: dict[int, int] = {}
         self._last_source_frame_id: int | None = None
+        self._current_source_timestamp: float | None = None
+        self._association_diagnostics: deque[dict[str, Any]] = deque(
+            maxlen=config.association_debug_max_events
+        )
         self._tracker = self._create_tracker()
 
     def _create_tracker(self):
@@ -64,6 +96,7 @@ class ByteTrackTracker:
                     tracks,
                     detections,
                     fuse_score=self.args.fuse_score,
+                    stage="high",
                 )
 
             def _second_association(
@@ -85,6 +118,7 @@ class ByteTrackTracker:
                         remaining,
                         detections_second,
                         fuse_score=False,
+                        stage="low",
                     )
                     matches, unmatched, _ = matching.linear_assignment(
                         dists,
@@ -114,102 +148,277 @@ class ByteTrackTracker:
         detections: list[Any],
         *,
         fuse_score: bool,
+        stage: str,
     ) -> NDArray[np.float32]:
         from ultralytics.trackers.utils import matching
 
-        cost = np.asarray(matching.iou_distance(tracks, detections), dtype=np.float32)
+        iou_cost = np.asarray(matching.iou_distance(tracks, detections), dtype=np.float32)
+        cost = iou_cost.copy()
         if self._config.association_mode == "hybrid" and tracks and detections:
+            # Ultralytics computes xyxy from Kalman state on every property
+            # access. Snapshot each box once for all project-specific geometry.
+            track_boxes = [item.xyxy for item in tracks]
+            detection_boxes = [item.xyxy for item in detections]
             track_points = np.asarray(
-                [self._bottom_center(item.xyxy) for item in tracks],
+                [self._bottom_center(box) for box in track_boxes],
                 dtype=np.float32,
             )
             detection_points = np.asarray(
-                [self._bottom_center(item.xyxy) for item in detections],
+                [self._bottom_center(box) for box in detection_boxes],
                 dtype=np.float32,
             )
             distances = np.linalg.norm(
                 track_points[:, None, :] - detection_points[None, :, :],
                 axis=2,
             )
-            maximum = max(
-                1.0,
-                self._frame_diagonal * self._config.max_center_distance_ratio,
+            track_heights_arr = np.asarray(
+                [max(1.0, float(box[3] - box[1])) for box in track_boxes],
+                dtype=np.float32,
             )
-            center_cost = np.clip(distances / maximum, 0.0, 1.0).astype(np.float32)
-            # When bounding boxes have zero overlap (cost >= 1.0), penalize center distance
-            # so we do not greedily hijack an adjacent person's detection in crowded scenes.
-            gated_center = np.where(
+            det_heights_arr = np.asarray(
+                [max(1.0, float(box[3] - box[1])) for box in detection_boxes],
+                dtype=np.float32,
+            )
+            current_frame = int(self._tracker.frame_id)
+            elapsed_frames = np.ones(len(tracks), dtype=np.float32)
+            velocities = np.zeros((len(tracks), 2), dtype=np.float32)
+            last_centers = np.zeros((len(tracks), 2), dtype=np.float32)
+            predicted_points = track_points.copy()
+            motion_quality = np.zeros(len(tracks), dtype=np.float32)
+            uncertainty = np.zeros(len(tracks), dtype=np.float32)
+            has_history = np.zeros(len(tracks), dtype=bool)
+            for row, track in enumerate(tracks):
+                history = self._motion_by_track.get(int(track.track_id))
+                uncertainty[row] = self._track_uncertainty_pixels(track)
+                if history is None:
+                    continue
+                elapsed = max(1, current_frame - history.frame_id)
+                elapsed_frames[row] = float(elapsed)
+                velocities[row] = history.velocity
+                last_centers[row] = history.center
+                predicted_points[row] = history.center + history.velocity * float(elapsed)
+                motion_quality[row] = history.quality
+                has_history[row] = True
+
+            if self._config.association_size_adaptive:
+                geometry_gate = np.maximum(
+                    self._config.association_distance_floor_pixels,
+                    self._config.association_distance_height_ratio
+                    * np.maximum(track_heights_arr[:, None], det_heights_arr[None, :]),
+                )
+                gap_multiplier = 1.0 + self._config.association_time_gap_growth * np.log1p(
+                    np.maximum(0.0, elapsed_frames - 1.0)
+                )
+                speed = np.linalg.norm(velocities, axis=1)
+                motion_allowance = speed * np.maximum(0.0, elapsed_frames - 1.0)
+                geometry_gate = np.maximum(
+                    geometry_gate * gap_multiplier[:, None],
+                    geometry_gate + uncertainty[:, None] + motion_allowance[:, None],
+                )
+                geometry_gate = np.minimum(
+                    geometry_gate,
+                    self._config.association_max_distance_pixels,
+                ).astype(np.float32)
+            else:
+                geometry_gate = np.full(
+                    (len(tracks), len(detections)),
+                    max(1.0, self._frame_diagonal * self._config.max_center_distance_ratio),
+                    dtype=np.float32,
+                )
+
+            center_cost = np.clip(distances / geometry_gate, 0.0, 1.0).astype(np.float32)
+            # When boxes do not overlap, retain a small penalty so an adjacent
+            # pedestrian cannot win merely because their bottom-center happens
+            # to be close.  The optional hard gate is applied after all soft
+            # motion costs so it cannot be bypassed by a low score.
+            cost = np.where(
                 cost < 1.0,
                 np.minimum(cost, center_cost),
                 np.clip(center_cost + 0.15, 0.0, 1.0),
-            )
-            cost = gated_center.astype(np.float32)
+            ).astype(np.float32)
 
+            motion_distance = np.zeros_like(distances)
+            motion_cost = np.full_like(distances, np.nan)
             motion_weight = self._config.motion_cost_weight
-            if motion_weight > 0.0 and self._motion_by_track:
-                current_frame = int(self._tracker.frame_id)
-                detection_heights = np.asarray(
-                    [float(item.xyxy[3] - item.xyxy[1]) for item in detections],
-                    dtype=np.float32,
+            if motion_weight > 0.0 and np.any(has_history):
+                motion_distance = np.linalg.norm(
+                    predicted_points[:, None, :] - detection_points[None, :, :],
+                    axis=2,
                 )
-                last_centers = np.zeros((len(tracks), 2), dtype=np.float32)
-                predicted_points = np.zeros((len(tracks), 2), dtype=np.float32)
-                velocities = np.zeros((len(tracks), 2), dtype=np.float32)
-                elapsed_frames = np.ones(len(tracks), dtype=np.float32)
-                track_heights = np.ones(len(tracks), dtype=np.float32)
-                has_history = np.zeros(len(tracks), dtype=bool)
-                for row, track in enumerate(tracks):
-                    history = self._motion_by_track.get(int(track.track_id))
-                    if history is None:
-                        continue
-                    last_center, velocity, last_frame = history
-                    elapsed = max(1, current_frame - last_frame)
-                    last_centers[row] = last_center
-                    predicted_points[row] = last_center + velocity * float(elapsed)
-                    velocities[row] = velocity
-                    elapsed_frames[row] = float(elapsed)
-                    track_heights[row] = max(1.0, float(track.xyxy[3] - track.xyxy[1]))
-                    has_history[row] = True
-                if np.any(has_history):
-                    distance = np.linalg.norm(
-                        predicted_points[:, None, :] - detection_points[None, :, :],
-                        axis=2,
+                speed = np.linalg.norm(velocities, axis=1)
+                if self._config.association_size_adaptive:
+                    motion_gate = np.maximum(
+                        geometry_gate,
+                        speed[:, None] * elapsed_frames[:, None]
+                        + self._config.association_distance_floor_pixels,
                     )
-                    median_detection_height = max(1.0, float(np.median(detection_heights)))
-                    velocity_speed = np.linalg.norm(velocities, axis=1)
-                    scale = np.maximum.reduce(
+                    motion_gate = np.minimum(
+                        motion_gate,
+                        self._config.association_max_distance_pixels,
+                    )
+                else:
+                    median_detection_height = max(
+                        1.0, float(np.median(det_heights_arr))
+                    )
+                    motion_scale = np.maximum.reduce(
                         [
                             np.full(len(tracks), 6.0, dtype=np.float32),
                             np.full(
                                 len(tracks),
-                                self._frame_diagonal * self._config.max_center_distance_ratio,
+                                self._frame_diagonal
+                                * self._config.max_center_distance_ratio,
                                 dtype=np.float32,
                             ),
-                            1.5 * velocity_speed * elapsed_frames,
+                            1.5 * speed * elapsed_frames,
                             0.5
-                            * np.maximum(track_heights, median_detection_height)
+                            * np.maximum(track_heights_arr, median_detection_height)
                             * elapsed_frames,
                         ]
                     )
-                    motion_cost = np.clip(distance / scale[:, None], 0.0, 1.0)
-                    displacement = detection_points[None, :, :] - last_centers[:, None, :]
-                    direction = np.sum(displacement * velocities[:, None, :], axis=2)
-                    reverse = direction < -0.25 * velocity_speed[:, None] * np.maximum(
-                        np.linalg.norm(displacement, axis=2), 1.0
+                    motion_gate = np.broadcast_to(
+                        motion_scale[:, None], distances.shape
                     )
-                    motion_cost = np.where(
-                        reverse & (velocity_speed[:, None] > 1.0),
-                        np.minimum(1.0, motion_cost + self._config.motion_direction_penalty),
-                        motion_cost,
-                    )
-                    cost[has_history] = (
-                        (1.0 - motion_weight) * cost[has_history]
-                        + motion_weight * motion_cost[has_history]
-                    )
+                motion_cost = np.clip(motion_distance / motion_gate, 0.0, 1.0)
+                displacement = detection_points[None, :, :] - last_centers[:, None, :]
+                directional_progress = np.sum(displacement * velocities[:, None, :], axis=2)
+                reverse = directional_progress < -0.25 * speed[:, None] * np.maximum(
+                    np.linalg.norm(displacement, axis=2), 1.0
+                )
+                # Direction is intentionally only a soft tie-breaker after
+                # multiple recent observations.  New, stationary and long-gap
+                # tracks may turn, so their geometry remains decisive.
+                reliable_motion = (
+                    has_history
+                    & (motion_quality >= 0.5)
+                    & (speed >= self._config.stationary_speed_threshold)
+                    & (elapsed_frames <= max(2.0, float(self._config.track_buffer)))
+                )
+                motion_cost = np.where(
+                    reverse & reliable_motion[:, None],
+                    np.minimum(1.0, motion_cost + self._config.motion_direction_penalty),
+                    motion_cost,
+                )
+                cost[has_history] = (
+                    (1.0 - motion_weight) * cost[has_history]
+                    + motion_weight * motion_cost[has_history]
+                )
+
+            accepted_by_gate = distances <= geometry_gate
+            if self._config.association_hard_gate:
+                cost[~accepted_by_gate] = 1.0
 
         if fuse_score:
             cost = np.asarray(matching.fuse_score(cost, detections), dtype=np.float32)
+        if self._config.association_mode == "hybrid" and tracks and detections:
+            if self._config.association_hard_gate:
+                cost[~accepted_by_gate] = 1.0
+            self._record_association_diagnostics(
+                tracks=tracks,
+                detections=detections,
+                stage=stage,
+                iou_cost=iou_cost,
+                final_cost=cost,
+                distances=distances,
+                geometry_gate=geometry_gate,
+                motion_distance=motion_distance,
+                motion_cost=motion_cost,
+                elapsed_frames=elapsed_frames,
+                accepted_by_gate=accepted_by_gate,
+            )
         return cost
+
+    def _track_uncertainty_pixels(self, track: Any) -> float:
+        """Return a bounded positional standard deviation from ByteTrack state.
+
+        This is not Mahalanobis matching: the project uses the tracker's
+        published state covariance only to avoid shrinking a geometry gate
+        below its own uncertainty.  Missing or malformed covariance means no
+        uncertainty expansion.
+        """
+        if not self._config.association_size_adaptive:
+            return 0.0
+        covariance = getattr(track, "covariance", None)
+        if covariance is None:
+            return 0.0
+        matrix = np.asarray(covariance, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[0] < 2 or matrix.shape[1] < 2:
+            return 0.0
+        variance = max(0.0, float(matrix[0, 0]) + float(matrix[1, 1]))
+        return min(
+            self._config.association_max_uncertainty_pixels,
+            self._config.association_uncertainty_weight * math.sqrt(variance),
+        )
+
+    def _record_association_diagnostics(
+        self,
+        *,
+        tracks: list[Any],
+        detections: list[Any],
+        stage: str,
+        iou_cost: NDArray[np.float32],
+        final_cost: NDArray[np.float32],
+        distances: NDArray[np.float32],
+        geometry_gate: NDArray[np.float32],
+        motion_distance: NDArray[np.float32],
+        motion_cost: NDArray[np.float32],
+        elapsed_frames: NDArray[np.float32],
+        accepted_by_gate: NDArray[np.bool_],
+    ) -> None:
+        if not self._config.association_debug:
+            return
+        frame_id = self._last_source_frame_id
+        frame_filter = set(self._config.association_debug_frame_ids)
+        if frame_filter and frame_id not in frame_filter:
+            return
+        track_filter = set(self._config.association_debug_track_ids)
+        for row, track in enumerate(tracks):
+            track_id = int(track.track_id)
+            if track_filter and track_id not in track_filter:
+                continue
+            # With no explicit target, retain only the two strongest choices
+            # per track.  This keeps the default diagnostic bounded even in a
+            # dense frame; a focused investigation may supply track IDs.
+            candidate_indices = np.argsort(final_cost[row])
+            if not track_filter:
+                candidate_indices = candidate_indices[:2]
+            for column in candidate_indices:
+                if len(self._association_diagnostics) >= self._config.association_debug_max_events:
+                    return
+                detection = detections[int(column)]
+                track_box = [round(float(value), 3) for value in track.xyxy]
+                detection_box = [round(float(value), 3) for value in detection.xyxy]
+                event = {
+                    "frame_id": frame_id,
+                    "source_timestamp_s": self._current_source_timestamp,
+                    "stage": stage,
+                    "track_id": track_id,
+                    "detection_index": int(column),
+                    "detection_confidence": round(float(getattr(detection, "score", 0.0)), 6),
+                    "track_bbox": track_box,
+                    "detection_bbox": detection_box,
+                    "track_height": round(track_box[3] - track_box[1], 3),
+                    "detection_height": round(detection_box[3] - detection_box[1], 3),
+                    "iou": round(1.0 - float(iou_cost[row, column]), 6),
+                    "bottom_center_distance_px": round(float(distances[row, column]), 4),
+                    "geometry_gate_px": round(float(geometry_gate[row, column]), 4),
+                    "motion_distance_px": round(float(motion_distance[row, column]), 4),
+                    "motion_score": (
+                        None
+                        if np.isnan(motion_cost[row, column])
+                        else round(float(motion_cost[row, column]), 6)
+                    ),
+                    "time_gap_frames": round(float(elapsed_frames[row]), 3),
+                    "cost": round(float(final_cost[row, column]), 6),
+                    "reason": "CANDIDATE" if accepted_by_gate[row, column] else "GEOMETRY_GATE_REJECTED",
+                }
+                self._association_diagnostics.append(event)
+                LOGGER.debug("tracking_association=%s", event)
+
+    def drain_association_diagnostics(self) -> list[dict[str, Any]]:
+        """Return and clear the bounded, opt-in association diagnostic buffer."""
+        events = list(self._association_diagnostics)
+        self._association_diagnostics.clear()
+        return events
 
     @staticmethod
     def _bottom_center(xyxy: NDArray) -> tuple[float, float]:
@@ -218,8 +427,12 @@ class ByteTrackTracker:
     def reset(self) -> None:
         self._tracker = self._create_tracker()
         self._motion_by_track.clear()
+        self._observation_history.clear()
+        self._direction_by_track.clear()
         self._coast_misses.clear()
         self._last_source_frame_id = None
+        self._current_source_timestamp = None
+        self._association_diagnostics.clear()
 
     def update(
         self,
@@ -227,7 +440,9 @@ class ByteTrackTracker:
         frame: NDArray[np.uint8],
         *,
         frame_id: int | None = None,
+        source_timestamp: float | None = None,
     ) -> list[TrackedObject]:
+        self._set_source_timestamp(source_timestamp)
         height, width = frame.shape[:2]
         self._frame_diagonal = float(np.hypot(width, height))
         if frame_id is not None:
@@ -289,7 +504,7 @@ class ByteTrackTracker:
                         item.result, width, height, observed=False
                     ))
 
-        self._update_motion_history(output)
+        output = self._update_tracking_history(output)
         for item in output:
             if item.observed:
                 self._coast_misses.pop(item.track_id, None)
@@ -300,6 +515,7 @@ class ByteTrackTracker:
         frame: NDArray[np.uint8],
         *,
         frame_id: int | None = None,
+        source_timestamp: float | None = None,
     ) -> list[TrackedObject]:
         """Advance predictions without treating an unsearched frame as a miss.
 
@@ -309,6 +525,7 @@ class ByteTrackTracker:
         This method advances only the Kalman state and labels every output as
         ``NOT_SEARCHED_BY_POLICY``; it does not create Common Path evidence.
         """
+        self._set_source_timestamp(source_timestamp)
         height, width = frame.shape[:2]
         self._frame_diagonal = float(np.hypot(width, height))
         if frame_id is None:
@@ -360,24 +577,67 @@ class ByteTrackTracker:
             )
             output.append(item)
             seen.add(track_id)
-        return sorted(output, key=lambda item: item.track_id)
+        return sorted(self._update_tracking_history(output), key=lambda item: item.track_id)
 
-    def _update_motion_history(self, output: list[TrackedObject]) -> None:
+    def _set_source_timestamp(self, source_timestamp: float | None) -> None:
+        if source_timestamp is not None and not math.isfinite(float(source_timestamp)):
+            raise ValueError("source_timestamp must be finite when provided")
+        self._current_source_timestamp = (
+            None if source_timestamp is None else float(source_timestamp)
+        )
+
+    def _observation_timestamp(self, current_frame: int) -> float:
+        """Use source media time; direct users get an explicit configurable fallback."""
+        if self._current_source_timestamp is not None:
+            return self._current_source_timestamp
+        return current_frame / self._config.direction_fallback_fps
+
+    def _update_tracking_history(self, output: list[TrackedObject]) -> list[TrackedObject]:
         current_frame = int(self._tracker.frame_id)
-        alpha = self._config.motion_history_alpha
+        current_timestamp = self._observation_timestamp(current_frame)
+        updated_output: list[TrackedObject] = []
         for item in output:
-            if not item.observed:
-                continue
-            center = np.asarray(item.bottom_center, dtype=np.float32)
-            previous = self._motion_by_track.get(item.track_id)
-            if previous is None:
-                velocity = np.zeros(2, dtype=np.float32)
-            else:
-                previous_center, previous_velocity, previous_frame = previous
-                elapsed = max(1, current_frame - previous_frame)
-                measured = (center - previous_center) / float(elapsed)
-                velocity = alpha * previous_velocity + (1.0 - alpha) * measured
-            self._motion_by_track[item.track_id] = (center, velocity, current_frame)
+            if item.observed:
+                center = np.asarray(item.bottom_center, dtype=np.float32)
+                previous = self._motion_by_track.get(item.track_id)
+                if previous is None:
+                    velocity = np.zeros(2, dtype=np.float32)
+                    quality = 0.0
+                else:
+                    elapsed = max(1, current_frame - previous.frame_id)
+                    measured = (center - previous.center) / float(elapsed)
+                    alpha = self._config.motion_history_alpha
+                    velocity = alpha * previous.velocity + (1.0 - alpha) * measured
+                    quality = min(
+                        1.0,
+                        previous.quality + (0.35 if elapsed == 1 else 0.15),
+                    )
+                self._motion_by_track[item.track_id] = _MotionState(
+                    center=center,
+                    velocity=velocity.astype(np.float32),
+                    frame_id=current_frame,
+                    quality=quality,
+                )
+                if self._config.direction_diagnostics_enabled:
+                    item = self._update_direction_estimate(
+                        item,
+                        current_frame=current_frame,
+                        timestamp_s=current_timestamp,
+                        center=center,
+                    )
+            elif self._config.direction_diagnostics_enabled:
+                # A prediction may display the latest observed estimate but it
+                # never appends history or raises the estimate's confidence.
+                estimate = self._direction_by_track.get(item.track_id)
+                if estimate is not None:
+                    item = replace(
+                        item,
+                        direction_vector=estimate.vector,
+                        direction_state=estimate.state,
+                        direction_quality=estimate.quality,
+                        direction_observed_span_s=estimate.observed_span_s,
+                    )
+            updated_output.append(item)
 
         active_ids = {
             int(track.track_id)
@@ -388,6 +648,102 @@ class ByteTrackTracker:
             for track_id, history in self._motion_by_track.items()
             if track_id in active_ids
         }
+        self._observation_history = {
+            track_id: history
+            for track_id, history in self._observation_history.items()
+            if track_id in active_ids
+        }
+        self._direction_by_track = {
+            track_id: estimate
+            for track_id, estimate in self._direction_by_track.items()
+            if track_id in active_ids
+        }
+        return updated_output
+
+    def _update_direction_estimate(
+        self,
+        item: TrackedObject,
+        *,
+        current_frame: int,
+        timestamp_s: float,
+        center: NDArray[np.float32],
+    ) -> TrackedObject:
+        history = self._observation_history.setdefault(item.track_id, [])
+        if history and (
+            timestamp_s <= history[-1].timestamp_s
+            or timestamp_s - history[-1].timestamp_s
+            > self._config.direction_max_observation_gap_seconds
+        ):
+            # A source-time rewind or an unobserved gap creates a fresh
+            # direction window.  It is not a new tracker segment and cannot
+            # alter Common Path, but prevents a prediction from validating a
+            # later turn or reappearance.
+            history.clear()
+        history.append(_ObservedPoint(current_frame, timestamp_s, center))
+        cutoff = timestamp_s - self._config.direction_history_seconds
+        while len(history) > 1 and history[0].timestamp_s < cutoff:
+            history.pop(0)
+
+        unknown = _DirectionEstimate(None, "unknown", 0.0, 0.0)
+        if len(history) < self._config.direction_min_observations:
+            self._direction_by_track[item.track_id] = unknown
+            return replace(
+                item,
+                direction_vector=None,
+                direction_state="unknown",
+                direction_quality=0.0,
+                direction_observed_span_s=0.0,
+            )
+
+        oldest = history[0]
+        displacement = center - oldest.center
+        span_s = timestamp_s - oldest.timestamp_s
+        displacement_length = float(np.linalg.norm(displacement))
+        if span_s < self._config.direction_min_observed_span_seconds:
+            self._direction_by_track[item.track_id] = unknown
+            return replace(
+                item,
+                direction_vector=None,
+                direction_state="unknown",
+                direction_quality=0.0,
+                direction_observed_span_s=max(0.0, span_s),
+            )
+
+        speed = displacement_length / span_s
+        previous_state = self._direction_by_track.get(item.track_id, unknown).state
+        if previous_state == "moving":
+            state = (
+                "stationary"
+                if speed <= self._config.direction_stationary_enter_speed_pixels_s
+                else "moving"
+            )
+        else:
+            state = (
+                "moving"
+                if speed >= self._config.direction_stationary_exit_speed_pixels_s
+                else "stationary"
+            )
+        sample_factor = min(
+            1.0,
+            len(history) / float(self._config.direction_min_observations + 2),
+        )
+        span_factor = min(1.0, span_s / self._config.direction_history_seconds)
+        quality = sample_factor * span_factor
+        vector = None
+        if state == "moving" and displacement_length >= self._config.direction_min_displacement_pixels:
+            vector = (
+                float(displacement[0] / displacement_length),
+                float(displacement[1] / displacement_length),
+            )
+        estimate = _DirectionEstimate(vector, state, quality, span_s)
+        self._direction_by_track[item.track_id] = estimate
+        return replace(
+            item,
+            direction_vector=estimate.vector,
+            direction_state=estimate.state,
+            direction_quality=estimate.quality,
+            direction_observed_span_s=estimate.observed_span_s,
+        )
 
     @staticmethod
     def _to_tracked_object(
@@ -398,11 +754,13 @@ class ByteTrackTracker:
         observed: bool = True,
         observation_coverage: str | None = None,
     ) -> TrackedObject:
+        max_x = float(width - 1)
+        max_y = float(height - 1)
         return TrackedObject(
-            x1=float(np.clip(row[0], 0, width - 1)),
-            y1=float(np.clip(row[1], 0, height - 1)),
-            x2=float(np.clip(row[2], 0, width - 1)),
-            y2=float(np.clip(row[3], 0, height - 1)),
+            x1=min(max(float(row[0]), 0.0), max_x),
+            y1=min(max(float(row[1]), 0.0), max_y),
+            x2=min(max(float(row[2]), 0.0), max_x),
+            y2=min(max(float(row[3]), 0.0), max_y),
             track_id=int(row[4]),
             confidence=float(row[5]),
             class_id=int(row[6]),

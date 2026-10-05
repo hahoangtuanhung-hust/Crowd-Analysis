@@ -478,15 +478,18 @@ class FrameRenderer:
         frame: NDArray[np.uint8], tracks: Sequence[TrackedObject]
     ) -> None:
         height, width = frame.shape[:2]
-        color = (80, 200, 120)
         for track in tracks:
+            color = (80, 200, 120) if track.observed else (0, 180, 255)
+            thickness = 2 if track.observed else 1
             x1 = min(width - 1, max(0, round(track.x1)))
             y1 = min(height - 1, max(0, round(track.y1)))
             x2 = min(width - 1, max(0, round(track.x2)))
             y2 = min(height - 1, max(0, round(track.y2)))
             if x2 <= x1 or y2 <= y1:
                 continue
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            cv2.rectangle(
+                frame, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA
+            )
 
     @staticmethod
     def _draw_debug_trajectories(
