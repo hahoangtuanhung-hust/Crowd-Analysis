@@ -1,0 +1,10 @@
+# Experimental detector workload candidate: every source frame is detected.
+# One full-frame image preserves global coverage. These two normalized crops
+# are exactly the upper row of the production 2x2 / 20%-overlap tile grid at
+# 1280x720: [(0,0,712,400), (568,0,1280,400)].
+extends: shibuya-overlap-batch2.yaml
+
+detector:
+  tile_regions_normalized:
+    - [0.000000, 0.000000, 0.556250, 0.555556]
+    - [0.443750, 0.000000, 1.000000, 0.555556]

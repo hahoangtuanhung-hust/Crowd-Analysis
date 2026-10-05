@@ -1,0 +1,8 @@
+# Experimental offline CPU-GPU overlap with 3 source frames (15 detector images).
+extends: shibuya.yaml
+
+video:
+  source_batch_size: 3
+  max_detector_images_per_batch: 15
+  offline_overlap_enabled: true
+  offline_overlap_queue_batches: 2

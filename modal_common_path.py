@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -22,12 +23,80 @@ image = (
     .apt_install("libglib2.0-0", "ffmpeg")
     .pip_install("lap>=0.5.12", "numpy>=2,<3", "opencv-python-headless>=4.10,<6",
                  "psutil>=6,<8", "pydantic>=2.10,<3", "pyyaml>=6,<7",
-                 "ultralytics>=8.4.116,<9")
+                 "ultralytics==8.4.155", "onnx>=1.17,<2",
+                 "onnxslim>=0.1.71,<1", "tensorrt-cu12>=10.8,<11",
+                 "torch==2.14.0", "torchvision==0.29.0")
     .add_local_dir("backend", remote_path="/root/backend")
     .add_local_file("scripts/common_path_clip.py", remote_path="/root/scripts/common_path_clip.py")
     .add_local_file("scripts/__init__.py", remote_path="/root/scripts/__init__.py")
     .add_local_file("yolo26n.pt", remote_path="/root/model/yolo26n.pt")
 )
+
+
+@app.function(image=image, gpu="T4", volumes={"/root/data": volume},
+              timeout=3600, retries=0, cpu=CPU_REQUEST_DEFAULT)
+def build_tensorrt_engine(model_hash: str, batch: int = 10,
+                          imgsz: int = 1280) -> dict:
+    """Build/cache one static TensorRT FP16 engine on the target T4."""
+    import platform
+    import torch
+    import ultralytics
+    import tensorrt
+    from ultralytics import YOLO
+
+    model = Path("/root/model/yolo26n.pt")
+    if not model.is_file() or _sha256(model) != model_hash:
+        raise ValueError("Source model missing/mismatched on TensorRT builder")
+    key = (
+        f"{model_hash[:16]}-u{ultralytics.__version__}-trt{tensorrt.__version__}"
+        f"-t4-b{batch}-i{imgsz}-fp16"
+    )
+    engine_dir = Path("/root/data/common_path/engines")
+    engine_dir.mkdir(parents=True, exist_ok=True)
+    engine_path = engine_dir / f"{key}.engine"
+    metadata_path = engine_dir / f"{key}.json"
+    if engine_path.is_file() and metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("engine_sha256") == _sha256(engine_path):
+            metadata["cache_hit"] = True
+            return metadata
+
+    started = time.perf_counter()
+    exported = YOLO(str(model)).export(
+        format="engine",
+        imgsz=imgsz,
+        batch=batch,
+        half=True,
+        dynamic=False,
+        device=0,
+        workspace=4,
+        simplify=True,
+        verbose=False,
+    )
+    exported_path = Path(str(exported))
+    if not exported_path.is_file():
+        raise RuntimeError(f"TensorRT export did not create an engine: {exported}")
+    shutil.copy2(exported_path, engine_path)
+    metadata = {
+        "backend": "tensorrt_fp16",
+        "cache_hit": False,
+        "engine_relative_path": str(engine_path.relative_to("/root/data")).replace("\\", "/"),
+        "engine_sha256": _sha256(engine_path),
+        "engine_size_bytes": engine_path.stat().st_size,
+        "engine_build_seconds": round(time.perf_counter() - started, 3),
+        "static_batch": batch,
+        "input_shape": [batch, 3, imgsz, imgsz],
+        "precision": "fp16",
+        "gpu": torch.cuda.get_device_name(0),
+        "ultralytics_version": ultralytics.__version__,
+        "tensorrt_version": tensorrt.__version__,
+        "torch_version": torch.__version__,
+        "python_version": platform.python_version(),
+        "source_model_sha256": model_hash,
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    volume.commit()
+    return metadata
 
 
 @app.function(image=image, gpu="T4", volumes={"/root/data": volume,},
@@ -38,7 +107,11 @@ image = (
 def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds: float,
             duration_seconds: float | None, engine: str, run_id: str,
             profile_gpu: bool = False,
-            cpu_request_physical_cores: float = CPU_REQUEST_DEFAULT) -> dict:
+            profile_cpu: bool = False,
+            detector_worker_mode: str = "",
+            cpu_request_physical_cores: float = CPU_REQUEST_DEFAULT,
+            inference_backend: str = "pytorch_fp32",
+            tensorrt_engine_info: dict | None = None) -> dict:
     import datetime as dt
     import sys
     import threading
@@ -61,9 +134,24 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
     from scripts.common_path_clip import digest, run
 
     source = Path(f"/root/data/common_path/inputs/{source_hash}.mp4")
-    model = Path("/root/model/yolo26n.pt")
-    if not source.is_file() or digest(source) != source_hash or digest(model) != model_hash:
+    source_model = Path("/root/model/yolo26n.pt")
+    if not source.is_file() or digest(source) != source_hash or digest(source_model) != model_hash:
         raise ValueError("Input or model missing/mismatched on Modal worker")
+    if inference_backend == "pytorch_fp32":
+        model = source_model
+        backend_model_hash = model_hash
+    elif inference_backend == "tensorrt_fp16":
+        if not tensorrt_engine_info:
+            raise ValueError("TensorRT engine metadata is required")
+        relative = Path(str(tensorrt_engine_info["engine_relative_path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Invalid TensorRT engine path")
+        model = Path("/root/data") / relative
+        backend_model_hash = str(tensorrt_engine_info["engine_sha256"])
+        if not model.is_file() or digest(model) != backend_model_hash:
+            raise ValueError("TensorRT engine missing/mismatched on Modal worker")
+    else:
+        raise ValueError(f"Unsupported inference backend: {inference_backend}")
     output = Path(f"/root/data/common_path/runs/{run_id}")
     config = Path(f"/tmp/{run_id}.yaml")
     config.write_text(config_text, encoding="utf-8")
@@ -104,7 +192,10 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
         manifest = run(source, output, config_path=config, model_path=model,
                        start_seconds=start_seconds, duration_seconds=duration_seconds,
                        engine=engine, run_id=run_id, input_hash=source_hash,
-                       model_hash=model_hash, profile_gpu=profile_gpu)
+                       model_hash=backend_model_hash, profile_gpu=profile_gpu,
+                       profile_cpu=profile_cpu,
+                       detector_worker_mode=detector_worker_mode or None,
+                       inference_backend=inference_backend)
         stop_sampling.set()
         sampler.join(timeout=3)
         elapsed = time.monotonic() - started
@@ -160,12 +251,27 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
                 "remote_wall_seconds": resources["remote_wall_seconds"],
             }
             summary["resources"] = resources
+            summary["backend_artifact"] = (
+                tensorrt_engine_info
+                if inference_backend == "tensorrt_fp16"
+                else {
+                    "backend": "pytorch_fp32",
+                    "source_model_sha256": model_hash,
+                    "model_size_bytes": source_model.stat().st_size,
+                }
+            )
             summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         manifest["remote_wall_seconds"] = round(elapsed, 2)
         manifest["completed_at_utc"] = resources["completed_at_utc"]
         manifest["resource_summary"] = resources
         manifest["cpu_request_physical_cores"] = cpu_request_physical_cores
         manifest["gpu"] = torch.cuda.get_device_name(0)
+        manifest["inference_backend"] = inference_backend
+        manifest["backend_artifact"] = (
+            tensorrt_engine_info
+            if inference_backend == "tensorrt_fp16"
+            else {"backend": "pytorch_fp32", "source_model_sha256": model_hash}
+        )
         manifest["artifacts"] = sorted(path.name for path in output.iterdir() if path.is_file())
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         volume.commit()
@@ -215,6 +321,9 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
          run_id: str = "", cache_policy: str = "reuse",
          download_artifacts: bool = False,
          profile_gpu: bool = False,
+         profile_cpu: bool = False,
+         detector_worker_mode: str = "",
+         inference_backend: str = "pytorch_fp32",
          cpu: float = CPU_REQUEST_DEFAULT) -> None:
     if mode != "offline_fast":
         raise ValueError("The batch runner only supports offline_fast; UI realtime is separate")
@@ -224,6 +333,8 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
         raise ValueError("Start must be >=0 seconds")
     if duration_seconds is not None and duration_seconds <= 0:
         raise ValueError("Duration must be >0 seconds when provided")
+    if inference_backend not in ("pytorch_fp32", "tensorrt_fp16", "ab"):
+        raise ValueError("inference_backend must be pytorch_fp32, tensorrt_fp16, or ab")
     cpu = _validate_cpu_request(cpu)
     source, settings, model = Path(input), Path(config), Path("yolo26n.pt")
     for path in (source, settings, model):
@@ -232,9 +343,18 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
     run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", run_id):
         raise ValueError("run_id must contain only letters, numbers, underscores, hyphens")
-    local_output = Path("outputs/common_path") / run_id
-    if download_artifacts and local_output.exists():
-        raise FileExistsError(local_output)
+    backend_runs = (
+        (("pytorch_fp32", f"{run_id}-torch"),
+         ("tensorrt_fp16", f"{run_id}-trt"))
+        if inference_backend == "ab"
+        else ((inference_backend, run_id),)
+    )
+    for _, backend_run_id in backend_runs:
+        if len(backend_run_id) > 64:
+            raise ValueError("backend run_id exceeds 64 characters")
+        local_output = Path("outputs/common_path") / backend_run_id
+        if download_artifacts and local_output.exists():
+            raise FileExistsError(local_output)
     source_hash, model_hash = _sha256(source), _sha256(model)
     # Resolve local `extends` profiles before sending the single immutable
     # config payload to the ephemeral worker.
@@ -262,40 +382,59 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
             upload_args.insert(1, "--force")
         _cli(*upload_args)
     configured_gpu_clip = gpu_clip.with_options(cpu=cpu)
-    manifest = configured_gpu_clip.remote(
-        source_hash,
-        model_hash,
-        resolved_config_text,
-        start_seconds,
-        duration_seconds,
-        engine,
-        run_id,
-        profile_gpu=profile_gpu,
-        cpu_request_physical_cores=cpu,
+    engine_info = (
+        build_tensorrt_engine.remote(model_hash, batch=10, imgsz=resolved_config.detector.imgsz)
+        if inference_backend in ("tensorrt_fp16", "ab") else None
     )
-    if manifest.get("status") != "success":
-        raise RuntimeError(f"Remote run failed: {manifest}")
-    remote_path = f"{VOLUME_NAME}:common_path/runs/{run_id}"
-    if not download_artifacts:
-        print(json.dumps({
-            "status": "gpu_completed",
-            "run_id": run_id,
-            "remote_path": remote_path,
-            "manifest": manifest,
-            "next_command": (
-                f"python scripts/download_modal_artifacts.py --run-id {run_id}"
+    completed: list[dict] = []
+    for backend_name, backend_run_id in backend_runs:
+        manifest = configured_gpu_clip.remote(
+            source_hash,
+            model_hash,
+            resolved_config_text,
+            start_seconds,
+            duration_seconds,
+            engine,
+            backend_run_id,
+            profile_gpu=profile_gpu,
+            profile_cpu=profile_cpu,
+            detector_worker_mode=detector_worker_mode,
+            cpu_request_physical_cores=cpu,
+            inference_backend=backend_name,
+            tensorrt_engine_info=(
+                engine_info if backend_name == "tensorrt_fp16" else None
             ),
-        }, indent=2))
-        return
-    local_output.mkdir(parents=True, exist_ok=False)
-    for filename in [*manifest["artifacts"], "manifest.json"]:
-        if Path(filename).name != filename:
-            raise ValueError("Unexpected artifact name from worker")
-        _cli("get", VOLUME_NAME, f"common_path/runs/{run_id}/{filename}",
-             str(local_output / filename))
-    local_manifest = json.loads((local_output / "manifest.json").read_text(encoding="utf-8"))
-    if not (local_output / "tracked_points_common_path.mp4").is_file():
-        raise RuntimeError("MP4 was not downloaded; run is not inspected")
-    print(json.dumps(dict(local_output=str(local_output.resolve()), manifest=local_manifest),
-                     indent=2))
+        )
+        if manifest.get("status") != "success":
+            raise RuntimeError(f"Remote run failed: {manifest}")
+        remote_path = f"{VOLUME_NAME}:common_path/runs/{backend_run_id}"
+        if not download_artifacts:
+            completed.append({
+                "run_id": backend_run_id,
+                "remote_path": remote_path,
+                "manifest": manifest,
+                "next_command": (
+                    "python scripts/download_modal_artifacts.py "
+                    f"--run-id {backend_run_id}"
+                ),
+            })
+            continue
+        local_output = Path("outputs/common_path") / backend_run_id
+        local_output.mkdir(parents=True, exist_ok=False)
+        # The remote manifest may already list itself after finalization.
+        for filename in dict.fromkeys([*manifest["artifacts"], "manifest.json"]):
+            if Path(filename).name != filename:
+                raise ValueError("Unexpected artifact name from worker")
+            _cli("get", VOLUME_NAME, f"common_path/runs/{backend_run_id}/{filename}",
+                 str(local_output / filename))
+        local_manifest = json.loads(
+            (local_output / "manifest.json").read_text(encoding="utf-8")
+        )
+        if not (local_output / "tracked_points_common_path.mp4").is_file():
+            raise RuntimeError("MP4 was not downloaded; run is not inspected")
+        completed.append({
+            "local_output": str(local_output.resolve()),
+            "manifest": local_manifest,
+        })
+    print(json.dumps({"status": "gpu_completed", "runs": completed}, indent=2))
     print("Review preview/contact sheet/debug images and write inspection.md before claiming success.")

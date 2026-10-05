@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import cProfile
 import csv
 import hashlib
 import importlib.metadata
+import io
 import json
 import math
 import platform
+import pstats
 import statistics
 import sys
+import threading
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from queue import Full, Queue
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -36,6 +41,37 @@ CACHE_SCHEMA = "detections-tracklets-v1"
 SCHEDULER_SCHEMA = "motion-roi-scheduler-v1"
 PROVENANCE_SCHEMA = "common-path-provenance-v2"
 DIAGNOSTIC_REGIONS = ("upper", "middle", "lower")
+
+
+def _detection_record(item: Detection) -> dict[str, object]:
+    """Serialize the flat cache schema without dataclasses.asdict deepcopy."""
+    return {
+        "x1": item.x1,
+        "y1": item.y1,
+        "x2": item.x2,
+        "y2": item.y2,
+        "confidence": item.confidence,
+        "class_id": item.class_id,
+    }
+
+
+def _track_record(item: TrackedObject) -> dict[str, object]:
+    """Serialize the flat cache schema without recursively copying scalars."""
+    return {
+        "track_id": item.track_id,
+        "x1": item.x1,
+        "y1": item.y1,
+        "x2": item.x2,
+        "y2": item.y2,
+        "confidence": item.confidence,
+        "class_id": item.class_id,
+        "observed": item.observed,
+        "observation_coverage": item.observation_coverage,
+        "direction_vector": item.direction_vector,
+        "direction_state": item.direction_state,
+        "direction_quality": item.direction_quality,
+        "direction_observed_span_s": item.direction_observed_span_s,
+    }
 
 
 def resolve_source_batch_size(
@@ -93,8 +129,369 @@ def read_source_batch(
             "frame_id": frame_id,
             "timestamp": timestamp,
             "decode_ms": decode_ms,
+            "decode_completed_at": time.perf_counter(),
         })
     return frames, metadata, batch_last_time
+
+
+class OfflineOverlapPipeline:
+    """Bounded ordered decode -> GPU inference pipeline for offline clips."""
+
+    _END = object()
+
+    def __init__(
+        self,
+        *,
+        capture: object,
+        detector: object,
+        start_frame: int,
+        end_frame_exclusive: int,
+        source_batch_size: int,
+        fps: float,
+        last_timestamp: float,
+        queue_batches: int,
+        inference_interval: int = 1,
+        profile_cpu: bool = False,
+    ) -> None:
+        self.capture = capture
+        self.detector = detector
+        self.start_frame = start_frame
+        self.end_frame_exclusive = end_frame_exclusive
+        self.source_batch_size = source_batch_size
+        self.inference_interval = max(1, int(inference_interval))
+        self.fps = fps
+        self.last_timestamp = last_timestamp
+        self.input_queue: Queue[object] = Queue(maxsize=queue_batches)
+        self.result_queue: Queue[object] = Queue(maxsize=queue_batches)
+        self.stop_event = threading.Event()
+        self.input_queue_peak = 0
+        self.result_queue_peak = 0
+        self.producer_put_wait_ms = 0.0
+        self.gpu_input_wait_ms = 0.0
+        self.result_put_wait_ms = 0.0
+        self.detection_scan_deadline_misses = 0
+        self.profile_cpu = profile_cpu
+        self.producer_profile: cProfile.Profile | None = None
+        self.gpu_profile: cProfile.Profile | None = None
+        self._producer = threading.Thread(
+            target=self._produce, name="offline-frame-producer", daemon=True
+        )
+        self._gpu = threading.Thread(
+            target=self._infer, name="offline-gpu-worker", daemon=True
+        )
+
+    def start(self) -> None:
+        self._producer.start()
+        self._gpu.start()
+
+    def _bounded_put(self, target: Queue[object], item: object) -> float:
+        started = time.perf_counter()
+        while not self.stop_event.is_set():
+            try:
+                target.put(item, timeout=0.1)
+                return (time.perf_counter() - started) * 1000
+            except Full:
+                continue
+        raise RuntimeError("offline overlap pipeline stopped while queueing")
+
+    def _produce(self) -> None:
+        profiler = cProfile.Profile() if self.profile_cpu else None
+        if profiler is not None:
+            profiler.enable()
+        next_frame = self.start_frame
+        last_timestamp = self.last_timestamp
+        last_detection_frame_id: int | None = None
+        pending_frames: list[np.ndarray] = []
+        pending_metadata: list[dict[str, Any]] = []
+        detection_indices: list[int] = []
+        try:
+            while next_frame < self.end_frame_exclusive and not self.stop_event.is_set():
+                frames, metadata, last_timestamp = read_source_batch(
+                    self.capture,
+                    start_frame_id=next_frame,
+                    end_frame_exclusive=self.end_frame_exclusive,
+                    source_batch_size=1,
+                    fps=self.fps,
+                    last_timestamp=last_timestamp,
+                )
+                if not frames:
+                    break
+                frame_id = int(metadata[0]["frame_id"])
+                detection_due = (
+                    last_detection_frame_id is None
+                    or frame_id - last_detection_frame_id >= self.inference_interval
+                )
+                if detection_due:
+                    if (
+                        last_detection_frame_id is not None
+                        and frame_id - last_detection_frame_id > self.inference_interval
+                    ):
+                        self.detection_scan_deadline_misses += 1
+                    detection_indices.append(len(pending_frames))
+                    last_detection_frame_id = frame_id
+                pending_frames.extend(frames)
+                pending_metadata.extend(metadata)
+                next_frame += 1
+                if len(detection_indices) >= self.source_batch_size:
+                    queued_at = time.perf_counter()
+                    wait_ms = self._bounded_put(
+                        self.input_queue,
+                        {
+                            "frames": pending_frames,
+                            "metadata": pending_metadata,
+                            "detection_indices": detection_indices,
+                            "queued_at": queued_at,
+                        },
+                    )
+                    self.producer_put_wait_ms += wait_ms
+                    self.input_queue_peak = max(
+                        self.input_queue_peak, self.input_queue.qsize()
+                    )
+                    pending_frames = []
+                    pending_metadata = []
+                    detection_indices = []
+            if pending_frames:
+                wait_ms = self._bounded_put(
+                    self.input_queue,
+                    {
+                        "frames": pending_frames,
+                        "metadata": pending_metadata,
+                        "detection_indices": detection_indices,
+                        "queued_at": time.perf_counter(),
+                    },
+                )
+                self.producer_put_wait_ms += wait_ms
+                self.input_queue_peak = max(
+                    self.input_queue_peak, self.input_queue.qsize()
+                )
+            self._bounded_put(self.input_queue, self._END)
+        except BaseException as exc:
+            if not self.stop_event.is_set():
+                self._bounded_put(self.input_queue, ("error", exc))
+        finally:
+            if profiler is not None:
+                profiler.disable()
+                self.producer_profile = profiler
+
+    def _infer(self) -> None:
+        profiler = cProfile.Profile() if self.profile_cpu else None
+        if profiler is not None:
+            profiler.enable()
+        try:
+            while not self.stop_event.is_set():
+                wait_started = time.perf_counter()
+                item = self.input_queue.get()
+                input_wait_ms = (time.perf_counter() - wait_started) * 1000
+                self.gpu_input_wait_ms += input_wait_ms
+                if item is self._END:
+                    self._bounded_put(self.result_queue, self._END)
+                    return
+                if isinstance(item, tuple) and item and item[0] == "error":
+                    self._bounded_put(self.result_queue, item)
+                    return
+                batch = dict(item)  # type: ignore[arg-type]
+                frames = batch["frames"]
+                detection_indices = [int(value) for value in batch["detection_indices"]]
+                inference_frames = [frames[index] for index in detection_indices]
+                if inference_frames:
+                    prepare = getattr(self.detector, "prepare_source_batch")
+                    infer = getattr(self.detector, "infer_prepared_batch")
+                    inputs, frame_metadata, tile_prepare_ms = prepare(inference_frames)
+                    inference_started = time.perf_counter()
+                    predictions, detector_stats = infer(inputs)
+                    inference_ms = (time.perf_counter() - inference_started) * 1000
+                else:
+                    frame_metadata = []
+                    predictions = []
+                    detector_stats = {}
+                    tile_prepare_ms = 0.0
+                    inference_ms = 0.0
+                result = {
+                    **batch,
+                    "frame_metadata": frame_metadata,
+                    "predictions": predictions,
+                    "detector_stats": detector_stats,
+                    "tile_prepare_ms": tile_prepare_ms,
+                    "batch_inference_ms": inference_ms,
+                    "gpu_input_wait_ms": input_wait_ms,
+                    "result_ready_at": time.perf_counter(),
+                }
+                wait_ms = self._bounded_put(self.result_queue, result)
+                self.result_put_wait_ms += wait_ms
+                self.result_queue_peak = max(self.result_queue_peak, self.result_queue.qsize())
+        except BaseException as exc:
+            if not self.stop_event.is_set():
+                self._bounded_put(self.result_queue, ("error", exc))
+        finally:
+            if profiler is not None:
+                profiler.disable()
+                self.gpu_profile = profiler
+
+    def next_batch(self) -> dict[str, Any] | None:
+        wait_started = time.perf_counter()
+        item = self.result_queue.get()
+        received_at = time.perf_counter()
+        if item is self._END:
+            return None
+        if isinstance(item, tuple) and item and item[0] == "error":
+            raise RuntimeError("offline overlap worker failed") from item[1]
+        result = dict(item)  # type: ignore[arg-type]
+        result["consumer_result_wait_ms"] = (received_at - wait_started) * 1000
+        result["result_queue_age_ms"] = (
+            received_at - float(result["result_ready_at"])
+        ) * 1000
+        return result
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self._producer.join(timeout=5)
+        self._gpu.join(timeout=5)
+
+
+def _write_cpu_profile(
+    profiler: cProfile.Profile | None,
+    output_dir: Path,
+    name: str,
+) -> None:
+    """Persist a machine-readable profile and a compact cumulative-time view."""
+    if profiler is None:
+        return
+    profiler.dump_stats(str(output_dir / f"cpu_profile_{name}.prof"))
+    stream = io.StringIO()
+    pstats.Stats(profiler, stream=stream).strip_dirs().sort_stats(
+        pstats.SortKey.CUMULATIVE
+    ).print_stats(120)
+    (output_dir / f"cpu_profile_{name}.txt").write_text(
+        stream.getvalue(), encoding="utf-8"
+    )
+
+
+def materialize_overlap_batch(
+    detector: object,
+    batch: dict[str, Any],
+    *,
+    detector_images_per_frame: int,
+    inference_batch_id: int,
+) -> list[dict[str, Any]]:
+    """Merge raw predictions in source order on the CPU consumer thread."""
+    frames = batch["frames"]
+    source_metadata = batch["metadata"]
+    frame_metadata = batch["frame_metadata"]
+    predictions = batch["predictions"]
+    batch_stats = dict(batch["detector_stats"])
+    detection_indices = [int(value) for value in batch.get(
+        "detection_indices", range(len(frames))
+    )]
+    detection_count = len(detection_indices)
+    detection_rank = {source_index: rank for rank, source_index in enumerate(detection_indices)}
+    merge = getattr(detector, "merge_prepared_frame")
+    amortized_fields = (
+        "model_predict_ms",
+        "ultralytics_predict_ms",
+        "result_transfer_ms",
+        "yolo_preprocess_total_ms",
+        "yolo_inference_total_ms",
+        "yolo_postprocess_total_ms",
+        "event_h2d_total_ms",
+        "event_tensor_conversion_total_ms",
+        "pre_transform_cpu_ms",
+        "stack_cpu_ms",
+        "layout_contiguous_cpu_ms",
+        "tensor_from_numpy_cpu_ms",
+    )
+    prepared: list[dict[str, Any]] = []
+    offset = 0
+    for index, (frame, metadata) in enumerate(zip(frames, source_metadata, strict=True)):
+        rank = detection_rank.get(index)
+        if rank is None:
+            prepared.append({
+                **metadata,
+                "frame": frame,
+                "detections": [],
+                "inference_ms": 0.0,
+                "detector_stats": {
+                    "model_invocations": 0,
+                    "inference_images": 0,
+                    "batch_size": 0,
+                    "source_batch_size": detection_count,
+                    "inference_batch_id": None,
+                },
+                "detector_images": 0,
+                "batch_index": index,
+                "intentional_skip": True,
+                "gpu_input_queue_wait_ms": None,
+                "consumer_result_wait_ms": None,
+                "result_ready_at": float(batch["result_ready_at"]),
+                "pipeline_started_at": (
+                    float(metadata["decode_completed_at"])
+                    - float(metadata["decode_ms"]) / 1000.0
+                ),
+            })
+            continue
+        tile_metadata = frame_metadata[rank]
+        count = len(tile_metadata)
+        detections, merge_ms = merge(
+            frame,
+            predictions[offset:offset + count],
+            tile_metadata,
+        )
+        offset += count
+        per_frame_stats = dict(batch_stats)
+        for field in amortized_fields:
+            value = batch_stats.get(field)
+            per_frame_stats[field] = (
+                float(value) / detection_count if value is not None else None
+            )
+        per_frame_stats.update({
+            "tile_prepare_ms": float(batch["tile_prepare_ms"]) / detection_count,
+            "merge_ms": merge_ms,
+            "postprocess_ms": (
+                float(per_frame_stats.get("result_transfer_ms") or 0.0) + merge_ms
+            ),
+            "model_invocations": 1 if rank == 0 else 0,
+            "inference_images": detector_images_per_frame,
+            "batch_size": int(batch_stats.get("batch_size") or 0),
+            "source_batch_size": detection_count,
+            "inference_batch_id": inference_batch_id,
+        })
+        batch_shapes = batch_stats.get("actual_tensor_shapes")
+        if isinstance(batch_shapes, list):
+            shape_start = rank * detector_images_per_frame
+            frame_shapes = batch_shapes[
+                shape_start:shape_start + detector_images_per_frame
+            ]
+            per_frame_stats["actual_tensor_shapes"] = frame_shapes
+            per_frame_stats["sum_tensor_pixels"] = sum(
+                int(shape[0]) * int(shape[1])
+                for shape in frame_shapes
+                if isinstance(shape, (list, tuple)) and len(shape) >= 2
+            )
+        prepared.append({
+            **metadata,
+            "frame": frame,
+            "detections": detections,
+            "inference_ms": (
+                float(batch["batch_inference_ms"]) / detection_count
+                + float(batch["tile_prepare_ms"]) / detection_count
+                + merge_ms
+            ),
+            "detector_stats": per_frame_stats,
+            "detector_images": detector_images_per_frame,
+            "batch_index": index,
+            "intentional_skip": False,
+            "gpu_input_queue_wait_ms": float(batch["gpu_input_wait_ms"]) / detection_count,
+            "consumer_result_wait_ms": (
+                float(batch["consumer_result_wait_ms"]) / detection_count
+            ),
+            "result_ready_at": float(batch["result_ready_at"]),
+            "pipeline_started_at": (
+                float(metadata["decode_completed_at"])
+                - float(metadata["decode_ms"]) / 1000.0
+            ),
+        })
+    if offset != len(predictions):
+        raise RuntimeError("Prepared prediction count does not match frame metadata")
+    return prepared
 
 
 def digest(path: Path) -> str:
@@ -124,7 +521,8 @@ def _motion_roi_payload(config: object) -> dict[str, object]:
 def scheduler_fingerprint(config: object) -> str:
     return _canonical_digest({
         "schema": SCHEDULER_SCHEMA,
-        "algorithm": "reference-or-existing-tile-mog2-v1",
+        "algorithm": "deadline-cadence-plus-reference-or-existing-tile-mog2-v2",
+        "inference_interval": int(config.video.inference_interval),
         "motion_roi": _motion_roi_payload(config),
     })
 
@@ -306,8 +704,12 @@ def _detector_workload(detector: object | None, config: object, frame_shape: Seq
         stats = {}
     scan_type = str(plan.get("scan_type", "reference"))
     detector_config = config.detector
+    configured_tile_count = (
+        len(detector_config.tile_regions_normalized)
+        or detector_config.tile_rows * detector_config.tile_columns
+    )
     reference_images = (
-        detector_config.tile_rows * detector_config.tile_columns
+        configured_tile_count
         + int(detector_config.tile_include_full_frame)
         if detector_config.tiled_inference else 1
     )
@@ -414,6 +816,12 @@ def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]])
     """Write stage percentiles and bounded video-time windows from one run."""
     stages = (
         ("decode", "decode_ms"),
+        ("tile_prepare", "tile_prepare_ms"),
+        ("yolo_preprocess_including_h2d", "yolo_preprocess_total_ms"),
+        ("host_to_device", "h2d_ms"),
+        ("tensor_conversion_normalize", "tensor_conversion_ms"),
+        ("yolo_model_inference", "yolo_inference_total_ms"),
+        ("yolo_postprocess", "yolo_postprocess_total_ms"),
         ("ultralytics_predict_wrapper", "model_predict_ms"),
         ("result_transfer", "result_transfer_ms"),
         ("project_postprocess_including_merge", "postprocess_ms"),
@@ -425,6 +833,11 @@ def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]])
         ("render", "render_ms"),
         ("encode", "encode_ms"),
         ("cache_write", "cache_write_ms"),
+        ("gpu_input_queue_wait", "gpu_input_queue_wait_ms"),
+        ("consumer_result_wait", "consumer_result_wait_ms"),
+        ("result_queue_age", "result_queue_age_ms"),
+        ("end_to_end_latency", "e2e_latency_ms"),
+        ("pipeline_overhead_or_idle", "pipeline_overhead_ms"),
         ("frame_total", "frame_total_ms"),
     )
     stage_rows = []
@@ -497,6 +910,7 @@ def cache_key(input_hash: str, model_hash: str, config: object, start: float,
                 tracker=config.tracker.model_dump(),
                 offline_batch={
                     "source_batch_size": config.video.source_batch_size,
+                    "inference_interval": config.video.inference_interval,
                     "max_detector_images_per_batch": (
                         config.video.max_detector_images_per_batch
                     ),
@@ -516,7 +930,10 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         replay_cache: Path | None = None, input_hash: str | None = None,
         model_hash: str | None = None, rebuild_tracks: bool = False,
         allow_cache_key_mismatch: bool = False,
-        profile_gpu: bool = False) -> dict:
+        profile_gpu: bool = False,
+        profile_cpu: bool = False,
+        detector_worker_mode: str | None = None,
+        inference_backend: str = "pytorch_fp32") -> dict:
     """Run video inference or analytics replay.
 
     Args:
@@ -524,6 +941,10 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             inference batch so GPU timing is isolated.  This adds ~50-80 ms per
             frame of blocking overhead; never use in production benchmarks.
             Default False preserves GPU pipeline overlap for maximum throughput.
+        profile_cpu: When True, writes separate cProfile captures for producer,
+            GPU worker, and consumer threads. Use only for diagnostic runs.
+        detector_worker_mode: One isolated detector-worker experiment. The
+            default preserves the standard Ultralytics path.
     """
     if start_seconds < 0:
         raise ValueError("Start must be >=0 seconds")
@@ -531,10 +952,15 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         raise ValueError("Duration must be >0 seconds when provided")
     if engine not in ("legacy", "directional_grid", "tracklet_aggregation", "shadow"):
         raise ValueError("Invalid engine")
+    if inference_backend not in ("pytorch_fp32", "tensorrt_fp16"):
+        raise ValueError("Invalid inference backend")
     if output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite run: {output_dir}")
     output_dir.mkdir(parents=True)
     config = load_config(config_path)
+    detector_worker_mode = (
+        detector_worker_mode or config.video.detector_worker_mode
+    )
     transformer: SpatialTransformer
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -580,6 +1006,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     device = "none (CPU analytics replay)"
     cuda_runtime = None
     detector = tracker = None
+    detector_init_ms = 0.0
     detector_warmup_ms = 0.0
     requested_source_batch_size = int(config.video.source_batch_size)
     effective_source_batch_size = 1
@@ -593,11 +1020,19 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         cuda_runtime = torch
         device = torch.cuda.get_device_name(0)
         from backend.app.inference import UltralyticsPersonDetector
+        from backend.app.inference.ultralytics_detector import DETECTOR_WORKER_MODES
         from backend.app.tracking import ByteTrackTracker
+        if detector_worker_mode not in DETECTOR_WORKER_MODES:
+            raise ValueError(f"Unsupported detector worker mode: {detector_worker_mode}")
         detection_config = config.detector.model_copy(
             update={"device": "cuda:0", "model": str(model_path or config.detector.model)}
         )
-        detector = UltralyticsPersonDetector(detection_config)
+        detector_init_started = time.perf_counter()
+        detector = UltralyticsPersonDetector(
+            detection_config,
+            worker_mode=detector_worker_mode,
+        )
+        detector_init_ms = (time.perf_counter() - detector_init_started) * 1000.0
         tracker = ByteTrackTracker(config.tracker)
         image_count_provider = getattr(detector, "reference_image_count", None)
         detector_images_per_reference = (
@@ -692,14 +1127,63 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     seen_track_ids: set[int] = set()
     diagnostic_limit = int(getattr(getattr(motion_config, "diagnostics", None), "max_decisions", 10000))
     diagnostic_stride = max(1, math.ceil(max(1, end_frame - start_frame) / diagnostic_limit))
+    overlap_pipeline: OfflineOverlapPipeline | None = None
+    overlap_enabled = bool(config.video.offline_overlap_enabled)
+    if overlap_enabled:
+        if replay_cache is not None:
+            raise ValueError("offline overlap is unavailable during cache replay")
+        if motion_enabled:
+            raise ValueError("offline overlap cannot run with tracker-feedback motion ROI")
+        required = ("prepare_source_batch", "infer_prepared_batch", "merge_prepared_frame")
+        if detector is None or any(not callable(getattr(detector, name, None)) for name in required):
+            raise ValueError("detector does not support offline overlap")
+        overlap_pipeline = OfflineOverlapPipeline(
+            capture=cap,
+            detector=detector,
+            start_frame=start_frame,
+            end_frame_exclusive=end_frame,
+            source_batch_size=effective_source_batch_size,
+            fps=fps,
+            last_timestamp=last_time,
+            queue_batches=int(config.video.offline_overlap_queue_batches),
+            inference_interval=int(config.video.inference_interval),
+            profile_cpu=profile_cpu,
+        )
     began = time.perf_counter()
+    consumer_profile = cProfile.Profile() if profile_cpu else None
     prepared_frames: list[dict[str, Any]] = []
     inference_batch_sequence = 0
+    if overlap_pipeline is not None:
+        overlap_pipeline.start()
+    if consumer_profile is not None:
+        consumer_profile.enable()
     try:
         for frame_id in range(start_frame, end_frame):
             t0 = time.perf_counter()
             prepared: dict[str, Any] | None = None
-            if effective_source_batch_size > 1 and cache_reader is None:
+            if overlap_pipeline is not None:
+                if not prepared_frames:
+                    overlap_batch = overlap_pipeline.next_batch()
+                    if overlap_batch is None:
+                        break
+                    inference_batch_sequence += 1
+                    prepared_frames.extend(materialize_overlap_batch(
+                        detector,
+                        overlap_batch,
+                        detector_images_per_frame=detector_images_per_reference,
+                        inference_batch_id=inference_batch_sequence,
+                    ))
+                prepared = prepared_frames.pop(0)
+                if int(prepared["frame_id"]) != frame_id:
+                    raise RuntimeError("Overlap inference frame order mismatch")
+                prepared["result_queue_age_ms"] = (
+                    time.perf_counter() - float(prepared["result_ready_at"])
+                ) * 1000
+                frame = prepared["frame"]
+                decode_ms = float(prepared["decode_ms"])
+                timestamp = float(prepared["timestamp"])
+                last_time = timestamp
+            elif effective_source_batch_size > 1 and cache_reader is None:
                 if not prepared_frames:
                     batch_frames, batch_metadata, _ = read_source_batch(
                         cap,
@@ -808,9 +1292,18 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                         if isinstance(executed_plan, dict) else "reference"
                     )
                     if cached_scan_type == "skip":
-                        tracks = tracker.coast(frame, frame_id=frame_id)
+                        tracks = tracker.coast(
+                            frame,
+                            frame_id=frame_id,
+                            source_timestamp=timestamp,
+                        )
                     else:
-                        tracks = tracker.update(detections, frame, frame_id=frame_id)
+                        tracks = tracker.update(
+                            detections,
+                            frame,
+                            frame_id=frame_id,
+                            source_timestamp=timestamp,
+                        )
                     tracking_ms = (time.perf_counter() - t1) * 1000
                 else:
                     tracks = [TrackedObject(**t) for t in entry["tracks"]]
@@ -820,9 +1313,30 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                 detector_stats = dict(prepared["detector_stats"])
                 inference_ms = float(prepared["inference_ms"])
                 detector_images = int(prepared["detector_images"])
-                scan_type = "reference"
                 t1 = time.perf_counter()
-                tracks = tracker.update(detections, frame, frame_id=frame_id)
+                if bool(prepared.get("intentional_skip")):
+                    scan_type = "skip"
+                    executed_plan = {
+                        "state": "CADENCE_SKIP",
+                        "scan_type": "skip",
+                        "proposed_scan_type": "skip",
+                        "reasons": ["cadence_skip"],
+                        "selected_tiles": [],
+                        "searched_regions": [],
+                    }
+                    tracks = tracker.coast(
+                        frame,
+                        frame_id=frame_id,
+                        source_timestamp=timestamp,
+                    )
+                else:
+                    scan_type = "reference"
+                    tracks = tracker.update(
+                        detections,
+                        frame,
+                        frame_id=frame_id,
+                        source_timestamp=timestamp,
+                    )
                 tracking_ms = (time.perf_counter() - t1) * 1000
             else:
                 import torch
@@ -920,9 +1434,18 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                         raise RuntimeError(
                             "motion ROI skip requires tracker.coast; refusing update([]) semantics"
                         )
-                    tracks = coast(frame, frame_id=frame_id)
+                    tracks = coast(
+                        frame,
+                        frame_id=frame_id,
+                        source_timestamp=timestamp,
+                    )
                 else:
-                    tracks = tracker.update(detections, frame, frame_id=frame_id)
+                    tracks = tracker.update(
+                        detections,
+                        frame,
+                        frame_id=frame_id,
+                        source_timestamp=timestamp,
+                    )
                 tracking_ms = (time.perf_counter() - t1) * 1000
 
             exposed_plan = executed_plan
@@ -984,8 +1507,8 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             cache_row = dict(
                 frame_id=frame_id,
                 event_time_s=timestamp,
-                detections=[asdict(d) for d in detections],
-                tracks=[asdict(t) for t in tracks],
+                detections=[_detection_record(d) for d in detections],
+                tracks=[_track_record(t) for t in tracks],
                 scheduler_decision=plan_record,
                 observation_coverage=coverage_by_track,
             )
@@ -1183,7 +1706,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                 snapshot, tuple(config.analytics.zones), transformer, overlay,
                 people_count=len(tracks), processing_fps=0, latency_ms=inference_ms,
                 timestamp=timestamp,
-                tracked_objects=tuple(track for track in tracks if track.observed))
+                tracked_objects=tuple(tracks))
             render_ms = (time.perf_counter() - t3) * 1000
             t4 = time.perf_counter()
             writer.write(rendered)
@@ -1194,9 +1717,52 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                 capture_frames.append(cv2.resize(rendered, (width // 3, height // 3)))
             frame_ids.append(frame_id)
             frame_total_ms = (time.perf_counter() - t0) * 1000
+            e2e_latency_ms = (
+                (time.perf_counter() - float(prepared["pipeline_started_at"])) * 1000
+                if prepared is not None and prepared.get("pipeline_started_at") is not None
+                else frame_total_ms
+            )
+            pipeline_overhead_ms = max(
+                0.0,
+                frame_total_ms
+                - decode_ms
+                - inference_ms
+                - tracking_ms
+                - analytics_ms
+                - render_ms
+                - encode_ms
+                - cache_write_ms,
+            )
+            intentional_skip = str(plan.get("scan_type")) == "skip"
             timings.append(dict(frame_id=frame_id, event_time_s=round(timestamp, 5),
                                 detections=len(detections), tracks=len(tracks), decode_ms=decode_ms,
-                                inference_ms=inference_ms, tracking_ms=tracking_ms,
+                                inference_ms=(None if intentional_skip else inference_ms),
+                                tracking_ms=tracking_ms,
+                                tile_prepare_ms=detector_stats.get("tile_prepare_ms"),
+                                yolo_preprocess_total_ms=detector_stats.get("yolo_preprocess_total_ms"),
+                                h2d_ms=detector_stats.get("event_h2d_total_ms"),
+                                tensor_conversion_ms=detector_stats.get(
+                                    "event_tensor_conversion_total_ms"
+                                ),
+                                pre_transform_cpu_ms=detector_stats.get("pre_transform_cpu_ms"),
+                                stack_cpu_ms=detector_stats.get("stack_cpu_ms"),
+                                layout_contiguous_cpu_ms=detector_stats.get(
+                                    "layout_contiguous_cpu_ms"
+                                ),
+                                tensor_from_numpy_cpu_ms=detector_stats.get(
+                                    "tensor_from_numpy_cpu_ms"
+                                ),
+                                yolo_inference_total_ms=detector_stats.get("yolo_inference_total_ms"),
+                                yolo_postprocess_total_ms=detector_stats.get("yolo_postprocess_total_ms"),
+                                detector_worker_mode=detector_stats.get(
+                                    "worker_mode", detector_worker_mode
+                                ),
+                                ultralytics_stage_synchronizations_per_batch=detector_stats.get(
+                                    "ultralytics_stage_synchronizations_per_batch"
+                                ),
+                                result_cpu_transfers_per_image=detector_stats.get(
+                                    "result_cpu_transfers_per_image"
+                                ),
                                 model_predict_ms=detector_stats.get("model_predict_ms"),
                                 result_transfer_ms=detector_stats.get("result_transfer_ms"),
                                 postprocess_ms=detector_stats.get("postprocess_ms"),
@@ -1215,6 +1781,20 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                 common_path_compute_ms=common_path_compute_ms,
                                 render_ms=render_ms, encode_ms=encode_ms,
                                 cache_write_ms=cache_write_ms,
+                                gpu_input_queue_wait_ms=(
+                                    prepared.get("gpu_input_queue_wait_ms")
+                                    if prepared is not None else None
+                                ),
+                                consumer_result_wait_ms=(
+                                    prepared.get("consumer_result_wait_ms")
+                                    if prepared is not None else None
+                                ),
+                                result_queue_age_ms=(
+                                    prepared.get("result_queue_age_ms")
+                                    if prepared is not None else None
+                                ),
+                                e2e_latency_ms=e2e_latency_ms,
+                                pipeline_overhead_ms=pipeline_overhead_ms,
                                 frame_total_ms=frame_total_ms,
                                 tracklet_buffered_segments=(
                                     tracklet.buffered_segment_count if tracklet is not None else None
@@ -1233,6 +1813,10 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             ram_samples_mb.append(float(timings[-1]["ram_mb"]))
             last_frame = frame.copy()
     finally:
+        if consumer_profile is not None:
+            consumer_profile.disable()
+        if overlap_pipeline is not None:
+            overlap_pipeline.close()
         cap.release()
         writer.release()
         if cache_reader:
@@ -1241,6 +1825,13 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             cache_writer.close()
         if rebuilt_cache_writer:
             rebuilt_cache_writer.close()
+        if profile_cpu:
+            _write_cpu_profile(consumer_profile, output_dir, "consumer")
+            if overlap_pipeline is not None:
+                _write_cpu_profile(
+                    overlap_pipeline.producer_profile, output_dir, "producer"
+                )
+                _write_cpu_profile(overlap_pipeline.gpu_profile, output_dir, "gpu_worker")
     frame_loop_elapsed = time.perf_counter() - began
     if not frame_ids:
         raise RuntimeError("Clip has no decoded frames")
@@ -1393,6 +1984,25 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             events.write(json.dumps(event) + "\n")
     (output_dir / "config_resolved.yaml").write_text(
         yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+    overlap_metrics = {
+        "enabled": overlap_pipeline is not None,
+        "queue_capacity_batches": int(config.video.offline_overlap_queue_batches),
+        "input_queue_peak_batches": (
+            overlap_pipeline.input_queue_peak if overlap_pipeline is not None else 0
+        ),
+        "result_queue_peak_batches": (
+            overlap_pipeline.result_queue_peak if overlap_pipeline is not None else 0
+        ),
+        "producer_put_wait_total_ms": round(
+            overlap_pipeline.producer_put_wait_ms, 3
+        ) if overlap_pipeline is not None else 0.0,
+        "gpu_input_wait_total_ms": round(
+            overlap_pipeline.gpu_input_wait_ms, 3
+        ) if overlap_pipeline is not None else 0.0,
+        "result_put_wait_total_ms": round(
+            overlap_pipeline.result_put_wait_ms, 3
+        ) if overlap_pipeline is not None else 0.0,
+    }
     provenance = {
         "schema": PROVENANCE_SCHEMA,
         "run_id": run_id,
@@ -1428,7 +2038,11 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         "motion_roi_enabled": motion_enabled,
         "motion_roi_shadow_mode": bool(getattr(motion_config, "shadow_mode", False)),
         "profile_gpu": profile_gpu,
+        "profile_cpu": profile_cpu,
+        "detector_worker_mode": detector_worker_mode,
+        "inference_backend": inference_backend,
         "phases": {
+            "detector_init_ms": round(detector_init_ms, 3),
             "detector_warmup_ms": round(detector_warmup_ms, 3),
             "frame_loop_seconds": round(frame_loop_elapsed, 3),
         },
@@ -1440,6 +2054,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
             ),
             "detector_images_per_reference_frame": detector_images_per_reference,
             "fallback_reason": source_batch_fallback_reason,
+            "overlap": overlap_metrics,
         },
         "versions": _package_versions(),
         "runtime": {"python_executable": sys.executable, "platform": platform.platform()},
@@ -1468,7 +2083,17 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         return round(float(np.percentile(values, 95)), 3) if values else 0.0
     switch_count = sum(event["event"] == "switch" for event in path_events)
     media_duration = max(last_time - start_seconds, 1e-9)
+    policy_skipped_frames = sum(
+        str(row.get("scan_type")) == "skip" for row in timings
+    )
+    association_updates = len(timings) - policy_skipped_frames
+    detector_images_total = sum(
+        int(row.get("inference_images") or 0) for row in timings
+    )
     final_snapshot = legacy_snapshot if selected == "legacy" else latest_snapshot
+    tracking_cache_sha256 = (
+        digest(cache_path) if replay_cache is None and cache_path.is_file() else None
+    )
     summary = dict(run_type="analytics_replay" if replay_cache else "gpu_pipeline",
                    engine=engine, selected_display=selected, frames=len(frame_ids),
                    first_frame=frame_ids[0], last_frame=frame_ids[-1],
@@ -1489,6 +2114,15 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    decode_p50_ms=p50("decode_ms"), decode_p95_ms=p95("decode_ms"),
                    detector_model_p50_ms=p50("model_predict_ms"),
                    detector_model_p95_ms=p95("model_predict_ms"),
+                   yolo_preprocess_p50_ms=p50("yolo_preprocess_total_ms"),
+                   yolo_preprocess_p95_ms=p95("yolo_preprocess_total_ms"),
+                   h2d_p50_ms=p50("h2d_ms"), h2d_p95_ms=p95("h2d_ms"),
+                   tensor_conversion_p50_ms=p50("tensor_conversion_ms"),
+                   tensor_conversion_p95_ms=p95("tensor_conversion_ms"),
+                   yolo_forward_p50_ms=p50("yolo_inference_total_ms"),
+                   yolo_forward_p95_ms=p95("yolo_inference_total_ms"),
+                   yolo_postprocess_p50_ms=p50("yolo_postprocess_total_ms"),
+                   yolo_postprocess_p95_ms=p95("yolo_postprocess_total_ms"),
                     detector_result_transfer_p50_ms=p50("result_transfer_ms"),
                     detector_result_transfer_p95_ms=p95("result_transfer_ms"),
                    detector_postprocess_p50_ms=p50("postprocess_ms"),
@@ -1501,6 +2135,15 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    encode_p50_ms=p50("encode_ms"), encode_p95_ms=p95("encode_ms"),
                    cache_write_p50_ms=p50("cache_write_ms"),
                    cache_write_p95_ms=p95("cache_write_ms"),
+                   gpu_input_queue_wait_p50_ms=p50("gpu_input_queue_wait_ms"),
+                   gpu_input_queue_wait_p95_ms=p95("gpu_input_queue_wait_ms"),
+                   consumer_result_wait_p50_ms=p50("consumer_result_wait_ms"),
+                   consumer_result_wait_p95_ms=p95("consumer_result_wait_ms"),
+                   result_queue_age_p50_ms=p50("result_queue_age_ms"),
+                   result_queue_age_p95_ms=p95("result_queue_age_ms"),
+                   e2e_latency_p50_ms=p50("e2e_latency_ms"),
+                   e2e_latency_p95_ms=p95("e2e_latency_ms"),
+                   offline_overlap=overlap_metrics,
                    directional_analytics_p95_ms=p95("directional_analytics_ms"),
                    legacy_analytics_p95_ms=p95("legacy_analytics_ms"),
                    path_switches=switch_count,
@@ -1512,26 +2155,48 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    processing_fps=round(len(frame_ids)/frame_loop_elapsed, 3),
                    processing_seconds=round(frame_loop_elapsed, 3),
                    artifact_finalize_seconds=round(artifact_finalize_seconds, 3),
+                   detector_init_ms=round(detector_init_ms, 3),
                    detector_warmup_ms=round(detector_warmup_ms, 3),
                    source_batch_size_requested=requested_source_batch_size,
                    source_batch_size_effective=effective_source_batch_size,
+                   inference_interval=int(config.video.inference_interval),
                    max_detector_images_per_batch=int(
                        config.video.max_detector_images_per_batch
                    ),
                    source_batch_fallback_reason=source_batch_fallback_reason,
+                   detector_worker_mode=detector_worker_mode,
+                   inference_backend=inference_backend,
+                   tracking_cache_sha256=tracking_cache_sha256,
                    inference_batches_total=sum(
                        int(row.get("model_invocations") or 0) for row in timings
                    ),
                     detector_invocations_total=sum(
                         int(row.get("model_invocations") or 0) for row in timings
                     ),
-                    detector_images_total=sum(
-                        int(row.get("inference_images") or 0) for row in timings
-                    ),
+                    detector_images_total=detector_images_total,
                     detector_images_per_source_frame=round(
-                        sum(int(row.get("inference_images") or 0) for row in timings)
-                        / max(1, len(frame_ids)), 3
+                        detector_images_total / max(1, len(frame_ids)), 3
                     ),
+                   detector_scans_total=association_updates,
+                   detector_scans_per_source_second=round(
+                       association_updates / media_duration, 3
+                   ),
+                   detector_scans_per_wall_second=round(
+                       association_updates / frame_loop_elapsed, 3
+                   ),
+                   detector_images_per_source_second=round(
+                       detector_images_total / media_duration, 3
+                   ),
+                   detector_images_per_wall_second=round(
+                       detector_images_total / frame_loop_elapsed, 3
+                   ),
+                   policy_skipped_frames=policy_skipped_frames,
+                   prediction_steps=policy_skipped_frames,
+                   association_updates=association_updates,
+                   detection_scan_deadline_misses=(
+                       overlap_pipeline.detection_scan_deadline_misses
+                       if overlap_pipeline is not None else 0
+                   ),
                    provenance_schema=PROVENANCE_SCHEMA,
                    config_hash=config_hash,
                    scheduler_fingerprint=scheduler_hash,
@@ -1564,17 +2229,30 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     manifest = dict(run_id=run_id, status="success", **{k: summary[k] for k in
                      ("run_type", "engine", "device", "frames", "processing_fps",
                       "processing_seconds", "artifact_finalize_seconds",
-                      "detector_warmup_ms",
+                      "detector_init_ms", "detector_warmup_ms",
                       "source_batch_size_requested", "source_batch_size_effective",
+                      "inference_interval",
                       "max_detector_images_per_batch", "source_batch_fallback_reason",
+                      "detector_worker_mode", "inference_backend", "tracking_cache_sha256",
                       "inference_batches_total",
                       "detector_invocations_total", "detector_images_total",
                       "detector_images_per_source_frame",
+                      "detector_scans_total", "detector_scans_per_source_second",
+                      "detector_scans_per_wall_second",
+                      "detector_images_per_source_second",
+                      "detector_images_per_wall_second", "policy_skipped_frames",
+                      "prediction_steps", "association_updates",
+                      "detection_scan_deadline_misses",
                       "inference_p50_ms", "inference_p95_ms", "tracking_p50_ms",
                       "tracking_p95_ms", "analytics_p50_ms", "analytics_p95_ms",
                       "render_p50_ms", "render_p95_ms", "encode_p50_ms",
                       "encode_p95_ms", "detector_result_transfer_p50_ms",
-                      "detector_result_transfer_p95_ms")},
+                      "detector_result_transfer_p95_ms",
+                      "yolo_preprocess_p50_ms", "yolo_preprocess_p95_ms",
+                      "h2d_p50_ms", "h2d_p95_ms",
+                      "yolo_forward_p50_ms", "yolo_forward_p95_ms",
+                      "yolo_postprocess_p50_ms", "yolo_postprocess_p95_ms",
+                      )},
                      input_hash=input_hash, model_hash=model_hash, cache_key=key,
                      cache_schema=CACHE_SCHEMA,
                      provenance_schema=PROVENANCE_SCHEMA,
@@ -1613,6 +2291,19 @@ def main() -> None:
     parser.add_argument("--profile-gpu", action="store_true",
                         help="Insert cuda.synchronize() around each inference for accurate per-stage "
                              "GPU timing. Adds ~50-80ms/frame overhead; never use in throughput benchmarks.")
+    parser.add_argument("--profile-cpu", action="store_true",
+                        help="Write per-thread cProfile artifacts; diagnostic runs only.")
+    parser.add_argument(
+        "--detector-worker-mode",
+        choices=("baseline", "no_sync_profile"),
+        default=None,
+        help="Run one isolated detector-worker optimization experiment.",
+    )
+    parser.add_argument(
+        "--inference-backend",
+        choices=("pytorch_fp32", "tensorrt_fp16"),
+        default="pytorch_fp32",
+    )
     args = parser.parse_args()
     print(json.dumps(run(args.input, args.output_dir, config_path=args.config, model_path=args.model,
                          start_seconds=args.start_seconds, duration_seconds=args.duration_seconds,
@@ -1620,7 +2311,10 @@ def main() -> None:
                          input_hash=args.source_hash, model_hash=args.model_hash,
                          rebuild_tracks=args.rebuild_tracks,
                          allow_cache_key_mismatch=args.allow_cache_key_mismatch,
-                         profile_gpu=args.profile_gpu)))
+                         profile_gpu=args.profile_gpu,
+                         profile_cpu=args.profile_cpu,
+                         detector_worker_mode=args.detector_worker_mode,
+                         inference_backend=args.inference_backend)))
 
 
 if __name__ == "__main__":

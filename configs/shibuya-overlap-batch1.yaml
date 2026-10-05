@@ -1,0 +1,9 @@
+# Experimental offline CPU-GPU overlap; detector/tracker/analytics semantics
+# remain inherited from the Shibuya reference profile.
+extends: shibuya.yaml
+
+video:
+  source_batch_size: 1
+  max_detector_images_per_batch: 5
+  offline_overlap_enabled: true
+  offline_overlap_queue_batches: 2

@@ -75,3 +75,39 @@ def test_compare_caches_rejects_frame_or_row_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Frame ID differs"):
         compare_caches(baseline, candidate)
+
+
+def test_sampled_comparison_limits_detection_to_candidate_scan_frames(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    common_detection = {"x1": 1, "y1": 1, "x2": 5, "y2": 9, "confidence": 0.8}
+    baseline_rows = []
+    candidate_rows = []
+    for frame_id in range(4):
+        baseline_rows.append({
+            "frame_id": frame_id,
+            "event_time_s": frame_id / 10,
+            "detections": [common_detection],
+            "tracks": [{**common_detection, "track_id": 1, "observed": True}],
+        })
+        scanned = frame_id in (0, 3)
+        candidate_rows.append({
+            "frame_id": frame_id,
+            "event_time_s": frame_id / 10,
+            "detections": [common_detection] if scanned else [],
+            "tracks": [{**common_detection, "track_id": 1, "observed": scanned}],
+            "scheduler_decision": {"scan_type": "reference" if scanned else "skip"},
+        })
+    _write_cache(baseline, baseline_rows)
+    _write_cache(candidate, candidate_rows)
+
+    result = compare_caches(baseline, candidate)
+
+    assert result["candidate_detection_scan_frames"] == 2
+    assert result["candidate_inference_interval_observed"] == 3
+    assert result["detections"]["frames"] == 2
+    assert result["detections"]["candidate_count_delta_percent"] == 0.0
+    assert result["all_tracks_including_predictions"]["candidate_prediction_only_rows"] == 2
+    assert result["all_tracks_including_predictions"]["iou50_candidate_match_percent"] == 100.0
