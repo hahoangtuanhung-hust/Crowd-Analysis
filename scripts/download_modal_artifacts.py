@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 VOLUME_NAME = "crowd-analysis-data"
@@ -32,7 +33,7 @@ def main() -> None:
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
-    command = ["modal", "volume", "get", args.volume, remote, str(output)]
+    command = [sys.executable, "-m", "modal", "volume", "get", args.volume, remote, str(output)]
     if args.force:
         command.append("--force")
     result = subprocess.run(

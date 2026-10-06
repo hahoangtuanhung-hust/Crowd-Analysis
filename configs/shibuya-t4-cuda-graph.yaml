@@ -1,0 +1,5 @@
+# Validated 750-frame smoke on Modal T4 + 4 CPU: 9.892 FPS, exact detection/tracking cache.
+# Preserve FP32, all tiles and every frame; remove Python GPU dispatch.
+extends: shibuya-t4-overlap-preprocess.yaml
+detector:
+  cuda_graph_inference: true

@@ -1,0 +1,3 @@
+# Verified 25-second T4 baseline comparison: every frame, FP32, five detector
+# images per frame. Core merge/tracklet optimizations apply automatically.
+extends: shibuya-overlap-batch2.yaml

@@ -1,0 +1,5 @@
+# FP32 keeps the validated detector coverage, resolution and numeric precision.
+# Bounded producer preparation overlaps letterbox/RGB packing with inference.
+extends: shibuya-t4-optimized.yaml
+detector:
+  offline_cpu_preprocess: true

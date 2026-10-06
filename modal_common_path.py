@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -137,7 +138,7 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
     source_model = Path("/root/model/yolo26n.pt")
     if not source.is_file() or digest(source) != source_hash or digest(source_model) != model_hash:
         raise ValueError("Input or model missing/mismatched on Modal worker")
-    if inference_backend == "pytorch_fp32":
+    if inference_backend in ("pytorch_fp32", "pytorch_fp16"):
         model = source_model
         backend_model_hash = model_hash
     elif inference_backend == "tensorrt_fp16":
@@ -255,7 +256,7 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
                 tensorrt_engine_info
                 if inference_backend == "tensorrt_fp16"
                 else {
-                    "backend": "pytorch_fp32",
+                    "backend": inference_backend,
                     "source_model_sha256": model_hash,
                     "model_size_bytes": source_model.stat().st_size,
                 }
@@ -270,7 +271,7 @@ def gpu_clip(source_hash: str, model_hash: str, config_text: str, start_seconds:
         manifest["backend_artifact"] = (
             tensorrt_engine_info
             if inference_backend == "tensorrt_fp16"
-            else {"backend": "pytorch_fp32", "source_model_sha256": model_hash}
+            else {"backend": inference_backend, "source_model_sha256": model_hash}
         )
         manifest["artifacts"] = sorted(path.name for path in output.iterdir() if path.is_file())
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -292,7 +293,7 @@ def _cli(*args: str) -> str:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    result = subprocess.run(["modal", "volume", *args], capture_output=True,
+    result = subprocess.run([sys.executable, "-m", "modal", "volume", *args], capture_output=True,
                             text=True, encoding="utf-8", errors="replace",
                             env=env, check=True)
     return result.stdout
@@ -333,8 +334,8 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
         raise ValueError("Start must be >=0 seconds")
     if duration_seconds is not None and duration_seconds <= 0:
         raise ValueError("Duration must be >0 seconds when provided")
-    if inference_backend not in ("pytorch_fp32", "tensorrt_fp16", "ab"):
-        raise ValueError("inference_backend must be pytorch_fp32, tensorrt_fp16, or ab")
+    if inference_backend not in ("pytorch_fp32", "pytorch_fp16", "tensorrt_fp16", "ab"):
+        raise ValueError("inference_backend must be pytorch_fp32, pytorch_fp16, tensorrt_fp16, or ab")
     cpu = _validate_cpu_request(cpu)
     source, settings, model = Path(input), Path(config), Path("yolo26n.pt")
     for path in (source, settings, model):
@@ -361,6 +362,12 @@ def main(input: str = "data/videos/data-test.mp4", start_seconds: float = 0.,
     import yaml
     from backend.app.core.config import load_config
     resolved_config = load_config(settings)
+    if inference_backend == "pytorch_fp16":
+        resolved_config.detector.precision = "fp16"
+    elif resolved_config.detector.precision == "fp16" and inference_backend == "pytorch_fp32":
+        raise ValueError("Use --inference-backend pytorch_fp16 for a PyTorch FP16 config")
+    if resolved_config.detector.input_shape is not None and inference_backend in ("tensorrt_fp16", "ab"):
+        raise ValueError("The cached square TensorRT engine cannot use rectangular input_shape")
     # Modal batch artifacts are review outputs: include the tracker boxes in
     # every rendered video while keeping the source profile unchanged on disk.
     resolved_config.visualization.show_bounding_boxes = True

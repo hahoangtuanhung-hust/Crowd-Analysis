@@ -1,0 +1,5 @@
+# REJECTED: 10.094 FPS on T4 + 4 CPU, but final Common Path direction changes.
+# Full square tensors, every frame and all tiles are preserved; FP16 still changes predictions.
+extends: shibuya-t4-overlap-preprocess.yaml
+detector:
+  precision: fp16

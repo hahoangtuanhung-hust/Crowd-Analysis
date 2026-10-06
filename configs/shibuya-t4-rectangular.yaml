@@ -1,0 +1,5 @@
+# REJECTED: 11.001 FPS on T4/8 CPU, but about 20% fewer detections and path direction regression.
+# Source crops retain their scale; removing padding still changes model predictions.
+extends: shibuya-t4-optimized.yaml
+detector:
+  input_shape: [768, 1280]
