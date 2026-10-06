@@ -71,6 +71,21 @@ python -m uvicorn backend.main:app --reload --port 8000
 The Common Path limit can then be changed from the dashboard without resetting
 the tracker. The detector profile remains separate from the display limit.
 
+For the validated T4 offline profile, use `configs/shibuya-t4-optimized.yaml`.
+The 2026-10-06 Modal test processed 750 Shibuya frames at 6.967 FPS versus
+5.982 FPS before optimization, with an identical detection/tracking cache and
+Common Path support history. See [benchmark details](docs/pipeline_optimization_t4_20261006.md).
+The faster `shibuya-perspective-t4.yaml` profile failed the quality comparison
+and remains diagnostic only.
+
+The follow-up profile `configs/shibuya-t4-cuda-graph.yaml` reached 9.892 FPS
+on a 750-frame clip on Modal T4 with 4 CPU cores, with the same detection/tracking cache and Common
+Path geometry. The 15 FPS target remains unmet; FP16 and rectangular inputs
+failed the path regression check. See [bottleneck analysis and tests](docs/pipeline_15fps_t4_20261006.md).
+The full `data-shibuya-10m.mp4` video (16,959 frames, 565.3 seconds) completed
+at 7.647 FPS on the same profile; the downloaded MP4 was verified by decoding
+all frames. Short-clip throughput is not a guarantee for the full video.
+
 **Terminal 2 (Frontend):**
 ```powershell
 cd frontend
