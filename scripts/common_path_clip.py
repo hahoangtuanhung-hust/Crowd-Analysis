@@ -97,6 +97,15 @@ def resolve_source_batch_size(
     return effective, None
 
 
+def count_inference_batches(timings: Sequence[dict[str, Any]]) -> int:
+    """Count source batches independently of their model resolution groups."""
+    batch_ids = {row["inference_batch_id"] for row in timings
+                 if row.get("inference_batch_id") is not None}
+    unbatched = sum(1 for row in timings if row.get("inference_batch_id") is None
+                    and int(row.get("model_invocations") or 0) > 0)
+    return len(batch_ids) + unbatched
+
+
 def read_source_batch(
     capture: object,
     *,
@@ -135,7 +144,7 @@ def read_source_batch(
 
 
 class OfflineOverlapPipeline:
-    """Bounded ordered decode -> GPU inference pipeline for offline clips."""
+    """Bounded ordered CPU preparation -> GPU inference for offline clips."""
 
     _END = object()
 
@@ -233,15 +242,9 @@ class OfflineOverlapPipeline:
                 pending_metadata.extend(metadata)
                 next_frame += 1
                 if len(detection_indices) >= self.source_batch_size:
-                    queued_at = time.perf_counter()
                     wait_ms = self._bounded_put(
                         self.input_queue,
-                        {
-                            "frames": pending_frames,
-                            "metadata": pending_metadata,
-                            "detection_indices": detection_indices,
-                            "queued_at": queued_at,
-                        },
+                        self._prepare_batch(pending_frames, pending_metadata, detection_indices),
                     )
                     self.producer_put_wait_ms += wait_ms
                     self.input_queue_peak = max(
@@ -253,12 +256,7 @@ class OfflineOverlapPipeline:
             if pending_frames:
                 wait_ms = self._bounded_put(
                     self.input_queue,
-                    {
-                        "frames": pending_frames,
-                        "metadata": pending_metadata,
-                        "detection_indices": detection_indices,
-                        "queued_at": time.perf_counter(),
-                    },
+                    self._prepare_batch(pending_frames, pending_metadata, detection_indices),
                 )
                 self.producer_put_wait_ms += wait_ms
                 self.input_queue_peak = max(
@@ -272,6 +270,19 @@ class OfflineOverlapPipeline:
             if profiler is not None:
                 profiler.disable()
                 self.producer_profile = profiler
+
+    def _prepare_batch(self, frames: list[np.ndarray], metadata: list[dict[str, Any]],
+                       detection_indices: list[int]) -> dict[str, Any]:
+        queued_at = time.perf_counter()
+        inference_frames = [frames[index] for index in detection_indices]
+        inputs, frame_metadata, prepare_ms = (
+            self.detector.prepare_source_batch(inference_frames)
+            if inference_frames else ([], [], 0.0)
+        )
+        return {"frames": frames, "metadata": metadata,
+                "detection_indices": detection_indices, "queued_at": queued_at,
+                "inputs": inputs, "frame_metadata": frame_metadata,
+                "tile_prepare_ms": prepare_ms}
 
     def _infer(self) -> None:
         profiler = cProfile.Profile() if self.profile_cpu else None
@@ -293,10 +304,11 @@ class OfflineOverlapPipeline:
                 frames = batch["frames"]
                 detection_indices = [int(value) for value in batch["detection_indices"]]
                 inference_frames = [frames[index] for index in detection_indices]
+                inputs = batch.pop("inputs")
+                frame_metadata = batch["frame_metadata"]
+                tile_prepare_ms = batch["tile_prepare_ms"]
                 if inference_frames:
-                    prepare = getattr(self.detector, "prepare_source_batch")
                     infer = getattr(self.detector, "infer_prepared_batch")
-                    inputs, frame_metadata, tile_prepare_ms = prepare(inference_frames)
                     inference_started = time.perf_counter()
                     predictions, detector_stats = infer(inputs)
                     inference_ms = (time.perf_counter() - inference_started) * 1000
@@ -448,12 +460,16 @@ def materialize_overlap_batch(
             "postprocess_ms": (
                 float(per_frame_stats.get("result_transfer_ms") or 0.0) + merge_ms
             ),
-            "model_invocations": 1 if rank == 0 else 0,
+            "model_invocations": int(batch_stats.get("model_invocations", 1)) if rank == 0 else 0,
             "inference_images": detector_images_per_frame,
             "batch_size": int(batch_stats.get("batch_size") or 0),
             "source_batch_size": detection_count,
             "inference_batch_id": inference_batch_id,
         })
+        workload = getattr(detector, "prepared_frame_workload", None)
+        if callable(workload) and getattr(detector.config.perspective_regions, "enabled", False):
+            per_frame_stats.update(workload(predictions[offset - count:offset], tile_metadata))
+            per_frame_stats["detections_after_merge"] = len(detections)
         batch_shapes = batch_stats.get("actual_tensor_shapes")
         if isinstance(batch_shapes, list):
             shape_start = rank * detector_images_per_frame
@@ -534,6 +550,8 @@ def _code_fingerprint() -> str:
         "backend/app/core/config.py",
         "backend/app/inference/ultralytics_detector.py",
         "backend/app/tracking/bytetrack_tracker.py",
+        "backend/app/analytics/tracklet_aggregation.py",
+        "backend/app/video/renderer.py",
         "backend/app/video/motion_roi.py",
     )
     result = hashlib.sha256()
@@ -866,9 +884,18 @@ def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]])
         window = int(float(row.get("event_time_s", 0.0)) // 60.0)
         windows.setdefault(window, []).append(row)
     window_rows = []
+    previous_window_end = 0.0
     for window, rows in sorted(windows.items()):
         timestamps = [float(row["event_time_s"]) for row in rows]
         span = max(timestamps[-1] - timestamps[0], 1e-9)
+        completed = rows[-1].get("pipeline_elapsed_seconds")
+        if completed is not None:
+            processing_seconds = max(float(completed) - previous_window_end, 1e-9)
+            previous_window_end = float(completed)
+        else:
+            frame_times = [float(row["frame_total_ms"]) for row in rows
+                           if row.get("frame_total_ms") is not None]
+            processing_seconds = sum(frame_times) / 1000.0 if frame_times else None
         def mean(field: str) -> float | None:
             values = [float(row[field]) for row in rows if row.get(field) is not None]
             return round(float(np.mean(values)), 3) if values else None
@@ -880,7 +907,8 @@ def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]])
             "window_end_s": round(window * 60.0 + 60.0, 3),
             "frames": len(rows),
             "media_span_s": round(span, 3),
-            "processing_fps": round(len(rows) / span, 3),
+            "processing_seconds": round(processing_seconds, 6) if processing_seconds else None,
+            "processing_fps": round(len(rows) / processing_seconds, 3) if processing_seconds else None,
             "inference_mean_ms": mean("inference_ms"),
             "tracking_mean_ms": mean("tracking_ms"),
             "common_path_mean_ms": mean("analytics_ms"),
@@ -895,7 +923,7 @@ def _write_stage_reports(output_dir: Path, timings: Sequence[dict[str, object]])
         })
     _write_csv_rows(
         output_dir / "long_run_metrics.csv", window_rows,
-        ("window_start_s", "window_end_s", "frames", "media_span_s", "processing_fps",
+        ("window_start_s", "window_end_s", "frames", "media_span_s", "processing_seconds", "processing_fps",
          "inference_mean_ms", "tracking_mean_ms", "common_path_mean_ms", "render_mean_ms",
          "encode_mean_ms", "frame_total_mean_ms", "detections_mean", "tracks_mean",
          "tracklet_buffered_peak", "tracklet_candidates_peak", "ram_peak_mb"),
@@ -906,7 +934,9 @@ def cache_key(input_hash: str, model_hash: str, config: object, start: float,
               duration: float | None) -> str:
     data = dict(schema=CACHE_SCHEMA, input_hash=input_hash,
                 model_hash=model_hash, start=start, duration=duration,
-                detector=config.detector.model_dump(exclude={"device", "model"}),
+                detector=config.detector.model_dump(exclude={"device", "model"}
+                    | ({"input_shape"} if config.detector.input_shape is None else set())
+                    | {"offline_cpu_preprocess", "cuda_graph_inference"}),
                 tracker=config.tracker.model_dump(),
                 offline_batch={
                     "source_batch_size": config.video.source_batch_size,
@@ -952,7 +982,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
         raise ValueError("Duration must be >0 seconds when provided")
     if engine not in ("legacy", "directional_grid", "tracklet_aggregation", "shadow"):
         raise ValueError("Invalid engine")
-    if inference_backend not in ("pytorch_fp32", "tensorrt_fp16"):
+    if inference_backend not in ("pytorch_fp32", "pytorch_fp16", "tensorrt_fp16"):
         raise ValueError("Invalid inference backend")
     if output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite run: {output_dir}")
@@ -1124,6 +1154,9 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
     path_support_rows: list[dict[str, object]] = []
     seen_candidate_diagnostics: set[str] = set()
     seen_path_support_diagnostics: set[str] = set()
+    diagnostic_compute_count = -1
+    candidate_trace: Sequence = ()
+    support_trace: Sequence = ()
     seen_track_ids: set[int] = set()
     diagnostic_limit = int(getattr(getattr(motion_config, "diagnostics", None), "max_decisions", 10000))
     diagnostic_stride = max(1, math.ceil(max(1, end_frame - start_frame) / diagnostic_limit))
@@ -1227,7 +1260,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                 float(value) / source_count if value is not None else None
                             )
                         per_frame_stats.update({
-                            "model_invocations": 1 if index == 0 else 0,
+                            "model_invocations": int(batch_stats.get("model_invocations", 1)) if index == 0 else 0,
                             "inference_images": detector_images_per_reference,
                             "batch_size": int(batch_stats.get("batch_size") or 0),
                             "source_batch_size": source_count,
@@ -1615,9 +1648,16 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                     dict(getattr(tracklet, "rejections", {}))
                     if tracklet is not None else {}
                 )
-                candidate_trace = getattr(tracklet, "candidate_decisions", ())
+                # Engine traces change only during compute. Avoid copying and
+                # hashing the same bounded history again on every video frame.
+                compute_count = len(tracklet.compute_ms) if tracklet is not None else 0
+                diagnostics_changed = compute_count != diagnostic_compute_count
+                if diagnostics_changed:
+                    candidate_trace = getattr(tracklet, "candidate_decisions", ())
+                    support_trace = getattr(tracklet, "path_support_diagnostics", ())
+                    diagnostic_compute_count = compute_count
                 if isinstance(candidate_trace, Sequence) and candidate_trace:
-                    for decision in candidate_trace:
+                    for decision in candidate_trace if diagnostics_changed else ():
                         if isinstance(decision, dict):
                             trace_key = _canonical_digest(decision)
                             if trace_key in seen_candidate_diagnostics:
@@ -1640,9 +1680,8 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                         "rejection_counts": rejection_counts,
                         "decision_status": "ENGINE_TRACE_NOT_EXPOSED",
                     })
-                support_trace = getattr(tracklet, "path_support_diagnostics", ())
                 if isinstance(support_trace, Sequence) and support_trace:
-                    for support in support_trace:
+                    for support in support_trace if diagnostics_changed else ():
                         if isinstance(support, dict):
                             trace_key = _canonical_digest(support)
                             if trace_key in seen_path_support_diagnostics:
@@ -1699,12 +1738,18 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                             else "NO_COMMON_PATH_ENGINE"
                         )
             t3 = time.perf_counter()
+            preview_fps = (len(frame_ids) + 1) / max(time.perf_counter() - began, 1e-6)
+            preview_latency_ms = (
+                (time.perf_counter() - float(prepared["pipeline_started_at"])) * 1000
+                if prepared is not None and prepared.get("pipeline_started_at") is not None
+                else (time.perf_counter() - t0) * 1000
+            )
             rendered = renderer.render_point_only_frame(
                 frame, [SimpleNamespace(track_id=t.track_id, x=t.bottom_center[0],
                                         y=t.bottom_center[1])
                         for t in tracks if t.observed],
                 snapshot, tuple(config.analytics.zones), transformer, overlay,
-                people_count=len(tracks), processing_fps=0, latency_ms=inference_ms,
+                people_count=len(tracks), processing_fps=preview_fps, latency_ms=preview_latency_ms,
                 timestamp=timestamp,
                 tracked_objects=tuple(tracks))
             render_ms = (time.perf_counter() - t3) * 1000
@@ -1739,6 +1784,9 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                 inference_ms=(None if intentional_skip else inference_ms),
                                 tracking_ms=tracking_ms,
                                 tile_prepare_ms=detector_stats.get("tile_prepare_ms"),
+                                model_tensor_shape=detector_stats.get("model_tensor_shape"),
+                                cuda_graph_replayed=detector_stats.get("cuda_graph_replayed"),
+                                cuda_graph_disabled_reason=detector_stats.get("cuda_graph_disabled_reason"),
                                 yolo_preprocess_total_ms=detector_stats.get("yolo_preprocess_total_ms"),
                                 h2d_ms=detector_stats.get("event_h2d_total_ms"),
                                 tensor_conversion_ms=detector_stats.get(
@@ -1796,6 +1844,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                                 e2e_latency_ms=e2e_latency_ms,
                                 pipeline_overhead_ms=pipeline_overhead_ms,
                                 frame_total_ms=frame_total_ms,
+                                pipeline_elapsed_seconds=time.perf_counter() - began,
                                 tracklet_buffered_segments=(
                                     tracklet.buffered_segment_count if tracklet is not None else None
                                 ),
@@ -2167,9 +2216,7 @@ def run(input_path: Path, output_dir: Path, *, config_path: Path, model_path: Pa
                    detector_worker_mode=detector_worker_mode,
                    inference_backend=inference_backend,
                    tracking_cache_sha256=tracking_cache_sha256,
-                   inference_batches_total=sum(
-                       int(row.get("model_invocations") or 0) for row in timings
-                   ),
+                   inference_batches_total=count_inference_batches(timings),
                     detector_invocations_total=sum(
                         int(row.get("model_invocations") or 0) for row in timings
                     ),
@@ -2301,7 +2348,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--inference-backend",
-        choices=("pytorch_fp32", "tensorrt_fp16"),
+        choices=("pytorch_fp32", "pytorch_fp16", "tensorrt_fp16"),
         default="pytorch_fp32",
     )
     args = parser.parse_args()

@@ -16,6 +16,7 @@ from collections import Counter, deque
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import cached_property
 from itertools import chain
 
 import numpy as np
@@ -63,6 +64,17 @@ class _Tracklet:
     displacement: float
     quality: float
     direction_consistency: float
+
+    @cached_property
+    def fingerprint(self) -> tuple[object, ...]:
+        # Include interior geometry: equal endpoints do not imply equal routes.
+        return (self.key, self.number, self.start_time, self.end_time,
+                self.points.shape, self.points.tobytes())
+
+    @cached_property
+    def matching_points(self) -> np.ndarray:
+        return (TrackletAggregationEngine._resample(self.points, 12)
+                if len(self.points) > 12 else self.points)
 
 
 @dataclass
@@ -413,10 +425,10 @@ class TrackletAggregationEngine:
         local = segments[segment_index]
         tangents = np.diff(first, axis=0)
         tangents = np.vstack((tangents, tangents[-1]))
-        cosines = np.array([
-            self._direction_cos(tangent, vector)
-            for tangent, vector in zip(tangents, local)
-        ])
+        denominators = np.maximum(
+            np.linalg.norm(tangents, axis=1) * np.linalg.norm(local, axis=1), 1e-9,
+        )
+        cosines = np.sum(tangents * local, axis=1) / denominators
         valid = (distances <= self.config.match_distance_fraction) & (
             cosines >= math.cos(math.radians(self.config.match_angle_degrees))
         )
@@ -453,15 +465,7 @@ class TrackletAggregationEngine:
 
     def _link_score(self, first: _Tracklet, second: _Tracklet) -> float:
         cfg = self.config
-        first_fingerprint = (
-            first.key, first.number, round(first.start_time, 6), round(first.end_time, 6),
-            len(first.points), tuple(np.round(first.points[-1], 6)),
-        )
-        second_fingerprint = (
-            second.key, second.number, round(second.start_time, 6), round(second.end_time, 6),
-            len(second.points), tuple(np.round(second.points[-1], 6)),
-        )
-        cache_key = (first_fingerprint, second_fingerprint)
+        cache_key = (first.fingerprint, second.fingerprint)
         cached = self._link_score_cache.get(cache_key)
         if cached is not None:
             self.link_score_cache_hits += 1
@@ -470,9 +474,10 @@ class TrackletAggregationEngine:
         if direction < math.cos(math.radians(cfg.match_angle_degrees)):
             score = 0.0
             self._link_score_cache[cache_key] = score
+            self._bound_link_cache()
             return score
-        overlap_a, distance_a = self._overlap_stats(first.points, second.points)
-        overlap_b, distance_b = self._overlap_stats(second.points, first.points)
+        overlap_a, distance_a = self._overlap_stats(first.matching_points, second.matching_points)
+        overlap_b, distance_b = self._overlap_stats(second.matching_points, first.matching_points)
         overlap = max(overlap_a, overlap_b)
         mean_distance = min(distance_a, distance_b)
         overlap_time_gap = max(first.start_time, second.start_time) - min(first.end_time, second.end_time)
@@ -493,8 +498,7 @@ class TrackletAggregationEngine:
                     )
                 score = 1.0 + overlap * 0.7 + direction * 0.25 - mean_distance - temporal_penalty
                 self._link_score_cache[cache_key] = score
-                if len(self._link_score_cache) > self.config.max_matching_tracklets * 256:
-                    self._link_score_cache.pop(next(iter(self._link_score_cache)))
+                self._bound_link_cache()
                 return score
 
         before, after = (first, second) if first.end_time <= second.start_time else (second, first)
@@ -502,6 +506,7 @@ class TrackletAggregationEngine:
         if gap < 0.0 or gap > cfg.max_link_gap_seconds:
             score = 0.0
             self._link_score_cache[cache_key] = score
+            self._bound_link_cache()
             return score
         predicted = before.points[-1] + before.direction * min(
             before.displacement / max(before.end_time - before.start_time, 1e-6) * gap,
@@ -513,9 +518,12 @@ class TrackletAggregationEngine:
         else:
             score = 0.65 + direction * 0.25 - endpoint_distance / max(cfg.match_distance_fraction * 3.0, 1e-9)
         self._link_score_cache[cache_key] = score
+        self._bound_link_cache()
+        return score
+
+    def _bound_link_cache(self) -> None:
         if len(self._link_score_cache) > self.config.max_matching_tracklets * 256:
             self._link_score_cache.pop(next(iter(self._link_score_cache)))
-        return score
 
     def _merge_overlap(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
         """Median-blend compatible samples while retaining the longer route extent."""
@@ -680,6 +688,11 @@ class TrackletAggregationEngine:
             tracklets = tracklets[:cfg.max_matching_tracklets]
             self.rejections["MATCHING_TRACKLET_CAP"] += dropped
         self.rejections["VALID_TRACKLETS"] = len(tracklets)
+        fingerprints = {item.fingerprint for item in tracklets}
+        self._link_score_cache = {
+            key: value for key, value in self._link_score_cache.items()
+            if key[0] in fingerprints and key[1] in fingerprints
+        }
         self.candidate_pool_count = 0
         if not tracklets:
             self.candidate_count = 0
@@ -943,7 +956,7 @@ class TrackletAggregationEngine:
             )
             identity.last_seen = timestamp
             identity.missing_since = None
-        for path_id in unmatched:
+        for path_id in sorted(unmatched):
             identity = self._identities[path_id]
             age = timestamp - identity.last_seen
             if identity.missing_since is None:

@@ -99,7 +99,7 @@ class FrameRenderer:
         directed_flows: DirectedFlowSnapshot | None = None,
         debug_trajectories: tuple[Trajectory, ...] = (),
     ) -> NDArray[np.uint8]:
-        frame = result.packet.image.copy()
+        frame = result.packet.image
         if options.heatmap:
             frame = self._draw_heatmap(frame, heatmap.occupancy, transformer)
 
@@ -291,7 +291,8 @@ class FrameRenderer:
             corridor_alpha = (0.75 if path.color else style.corridor_opacity) * (0.55 if cooling else 1.0)
             cv2.addWeighted(corridor, corridor_alpha, frame, 1.0 - corridor_alpha, 0.0, frame)
 
-            centerline = frame.copy()
+            line_alpha = (1.0 if path.color else style.centerline_opacity) * (0.65 if cooling else 1.0)
+            centerline = frame if line_alpha == 1.0 else frame.copy()
             cv2.polylines(
                 centerline,
                 [points],
@@ -310,8 +311,8 @@ class FrameRenderer:
                     max(2, center_width // 2),
                     style.arrow_spacing_pixels,
                 )
-            line_alpha = (1.0 if path.color else style.centerline_opacity) * (0.65 if cooling else 1.0)
-            cv2.addWeighted(centerline, line_alpha, frame, 1.0 - line_alpha, 0.0, frame)
+            if line_alpha != 1.0:
+                cv2.addWeighted(centerline, line_alpha, frame, 1.0 - line_alpha, 0.0, frame)
             self._draw_path_label(frame, path, center_color)
 
     def _draw_candidate_paths(

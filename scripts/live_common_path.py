@@ -203,7 +203,9 @@ class LiveCommonPathProcessor:
             detector_config = config.detector.model_copy(
                 update={"device": "cuda:0", "model": str(self.model_path)}
             )
-            self.detector = UltralyticsPersonDetector(detector_config)
+            self.detector = UltralyticsPersonDetector(
+                detector_config, worker_mode=config.video.detector_worker_mode,
+            )
         model_ready_s = time.perf_counter() - boot_started
 
         writer = cv2.VideoWriter(

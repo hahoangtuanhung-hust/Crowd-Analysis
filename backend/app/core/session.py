@@ -432,7 +432,11 @@ class SessionManager:
         detector_factory: Callable[[DetectorConfig], PersonDetector] = UltralyticsPersonDetector,
     ) -> None:
         self.config = config
-        self._detector_factory = detector_factory
+        self._detector_factory = (
+            lambda detector_config: UltralyticsPersonDetector(
+                detector_config, worker_mode=config.video.detector_worker_mode,
+            )
+        ) if detector_factory is UltralyticsPersonDetector else detector_factory
         self._detector: PersonDetector | None = None
         self._detector_warmed = False
         self._session: ProcessingSession | None = None

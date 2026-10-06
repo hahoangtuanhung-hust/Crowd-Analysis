@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import time
+import logging
 from contextlib import contextmanager
 from collections.abc import Sequence
+from dataclasses import dataclass
 from types import MethodType
 from typing import Any
 
@@ -12,11 +14,48 @@ from numpy.typing import NDArray
 from backend.app.core.config import DetectorConfig
 from backend.app.schemas import Detection
 
+LOGGER = logging.getLogger(__name__)
+
 
 DETECTOR_WORKER_MODES = (
     "baseline",
     "no_sync_profile",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _PerspectiveCrop:
+    bounds: tuple[int, int, int, int]
+    region: str
+    group: tuple[int, bool, float, str | None]
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+
+
+CropMetadata = tuple[int, int, int, int] | _PerspectiveCrop | None
+
+
+class _PreparedInputs(list[NDArray[np.uint8]]):
+    """Batch-owned resolution groups; no mutable planning state on the worker."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.groups: dict[tuple[int, bool, float, str | None], list[int]] = {}
+        self.preprocessed: NDArray[np.uint8] | None = None
+
+
+def _pack_rgb_chw(images: Sequence[NDArray[np.uint8]]) -> NDArray[np.uint8]:
+    """Pack letterboxed BGR images directly into contiguous RGB NCHW.
+
+    Avoid a second full-size NHWC batch allocation and memory copy. Each
+    image is copied with the same channel reversal as Ultralytics preprocess.
+    """
+    height, width, channels = images[0].shape
+    packed = np.empty((len(images), channels, height, width), dtype=np.uint8)
+    for index, image in enumerate(images):
+        source = image[..., ::-1] if channels == 3 else image
+        np.copyto(packed[index], source.transpose(2, 0, 1))
+    return packed
 
 
 class _NonSynchronizingProfile:
@@ -109,7 +148,7 @@ def _same_detection(first: Detection, second: Detection, iou_threshold: float) -
     return iou >= iou_threshold or intersection_over_smaller >= 0.8
 
 
-def _merge_detections(
+def _merge_detections_reference(
     detections: list[Detection],
     *,
     iou_threshold: float,
@@ -212,6 +251,99 @@ def _merge_detections(
     return selected
 
 
+def _merge_detections(
+    detections: list[Detection],
+    *,
+    iou_threshold: float,
+    max_detections: int,
+    source_ids: Sequence[int] | None = None,
+) -> list[Detection]:
+    """Source-aware greedy suppression with bounded vectorized comparisons.
+
+    Keep confidence order and the reference float32 geometry. Compute overlap
+    for blocks rather than allocating half a dozen arrays for each candidate.
+    Only previously accepted boxes suppress a candidate (never rejected boxes).
+    """
+    if source_ids is not None and len(source_ids) != len(detections):
+        raise ValueError("source_ids must have one entry per detection")
+    if len(detections) < 32:
+        return _merge_detections_reference(
+            detections, iou_threshold=iou_threshold,
+            max_detections=max_detections, source_ids=source_ids,
+        )
+    order = sorted(range(len(detections)), key=lambda i: detections[i].confidence, reverse=True)
+    ordered = [detections[i] for i in order]
+    boxes = np.asarray([d.xyxy for d in ordered], dtype=np.float32)
+    sizes = np.maximum(0.0, boxes[:, 2:] - boxes[:, :2])
+    areas = sizes[:, 0] * sizes[:, 1]
+    centers = (boxes[:, :2] + boxes[:, 2:]) / np.float32(2.0)
+    diagonals = np.hypot(sizes[:, 0], sizes[:, 1])
+    classes = np.asarray([d.class_id for d in ordered])
+    sources = np.asarray([source_ids[i] for i in order]) if source_ids is not None else None
+    # The candidate side of the reference kernel calculates geometry before
+    # casting to float32; preserve that distinction at threshold boundaries.
+    candidate_areas = np.asarray([
+        max(0.0, d.x2 - d.x1) * max(0.0, d.y2 - d.y1) for d in ordered
+    ], dtype=np.float32)
+    candidate_centers = np.asarray([
+        ((d.x1 + d.x2) / 2.0, (d.y1 + d.y2) / 2.0) for d in ordered
+    ], dtype=np.float32)
+    candidate_diagonals = np.asarray([
+        np.hypot(d.x2 - d.x1, d.y2 - d.y1) for d in ordered
+    ], dtype=np.float32)
+    selected_indices: list[int] = []
+    # Bound scratch memory even for up to 80 detector images. Typical crowded
+    # frames use 128 rows; large candidate lists use a smaller block.
+    block_size = max(1, min(128, 262144 // len(ordered)))
+    for start in range(0, len(ordered), block_size):
+        stop = min(len(ordered), start + block_size)
+        first = boxes[start:stop]
+        # Rejected candidates and later blocks can never suppress this block.
+        # Compare only with accepted predecessors and candidates in this block.
+        prefix_count = len(selected_indices)
+        reference_indices = np.asarray([*selected_indices, *range(start, stop)])
+        reference_boxes = boxes[reference_indices]
+        selected_columns = list(range(prefix_count))
+        intersection = np.maximum(
+            0.0, np.minimum(first[:, None, 2], reference_boxes[None, :, 2])
+            - np.maximum(first[:, None, 0], reference_boxes[None, :, 0]),
+        ) * np.maximum(
+            0.0, np.minimum(first[:, None, 3], reference_boxes[None, :, 3])
+            - np.maximum(first[:, None, 1], reference_boxes[None, :, 1]),
+        )
+        first_area = candidate_areas[start:stop, None]
+        reference_areas = areas[reference_indices][None, :]
+        union = first_area + reference_areas - intersection
+        smaller = np.minimum(first_area, reference_areas)
+        larger = np.maximum(first_area, reference_areas)
+        iou = np.divide(intersection, union, out=np.zeros_like(intersection), where=union > 0)
+        containment = np.divide(
+            intersection, smaller, out=np.zeros_like(intersection), where=smaller > 0,
+        )
+        scale = np.divide(smaller, larger, out=np.zeros_like(intersection), where=larger > 0)
+        distance = np.linalg.norm(
+            centers[reference_indices][None, :, :] - candidate_centers[start:stop, None, :], axis=2,
+        )
+        center_limit = np.maximum(
+            3.0, 0.5 * np.minimum(candidate_diagonals[start:stop, None], diagonals[reference_indices][None, :]),
+        )
+        duplicates = (
+            (classes[start:stop, None] == classes[reference_indices][None, :])
+            & (scale >= 0.35) & (distance <= center_limit)
+            & ((iou >= iou_threshold) | (containment >= 0.8))
+        )
+        if sources is not None:
+            duplicates &= sources[start:stop, None] != sources[reference_indices][None, :]
+        for index in range(start, stop):
+            if selected_columns and np.any(duplicates[index - start, selected_columns]):
+                continue
+            selected_indices.append(index)
+            selected_columns.append(prefix_count + index - start)
+            if len(selected_indices) >= max_detections:
+                return [ordered[i] for i in selected_indices]
+    return [ordered[i] for i in selected_indices]
+
+
 def _in_ignore_region(
     detection: Detection,
     *,
@@ -275,10 +407,10 @@ class UltralyticsPersonDetector:
                 def measured_preprocess(predictor_self: Any, im: Any) -> Any:
                     """Mirror BasePredictor.preprocess and isolate its H2D copy.
 
-                    This intentionally preserves Ultralytics' operation order and
-                    default blocking ``Tensor.to`` behavior. Both A/B backends use
-                    this path, so the profiler does not introduce a backend-only
-                    optimization.
+                    RGB packing preserves the input bytes while avoiding the
+                    intermediate NHWC batch. A prepared offline batch can move
+                    this CPU work to the bounded producer queue. H2D and numeric
+                    conversion retain the original operation order.
                     """
                     started = torch.cuda.Event(enable_timing=True)
                     completed = torch.cuda.Event(enable_timing=True)
@@ -290,24 +422,26 @@ class UltralyticsPersonDetector:
                     started.record()
                     not_tensor = not isinstance(im, torch.Tensor)
                     if not_tensor:
-                        pre_transform_started = time.perf_counter()
-                        transformed = predictor_self.pre_transform(im)
-                        owner._phase_stats["pre_transform_cpu_ms"] = (
-                            time.perf_counter() - pre_transform_started
-                        ) * 1000.0
-                        stack_started = time.perf_counter()
-                        im = np.stack(transformed)
-                        owner._phase_stats["stack_cpu_ms"] = (
-                            time.perf_counter() - stack_started
-                        ) * 1000.0
-                        layout_started = time.perf_counter()
-                        if im.shape[-1] == 3:
-                            im = im[..., ::-1]
-                        im = im.transpose((0, 3, 1, 2))
-                        im = np.ascontiguousarray(im)
-                        owner._phase_stats["layout_contiguous_cpu_ms"] = (
-                            time.perf_counter() - layout_started
-                        ) * 1000.0
+                        prepared = getattr(owner, "_pending_preprocess", None)
+                        if prepared is not None:
+                            if prepared.shape[0] != len(im):
+                                raise ValueError("Prepared detector batch size mismatch")
+                            im = prepared
+                            owner._phase_stats.update(pre_transform_cpu_ms=0.0,
+                                                      stack_cpu_ms=0.0,
+                                                      layout_contiguous_cpu_ms=0.0)
+                        else:
+                            pre_transform_started = time.perf_counter()
+                            transformed = predictor_self.pre_transform(im)
+                            owner._phase_stats["pre_transform_cpu_ms"] = (
+                                time.perf_counter() - pre_transform_started
+                            ) * 1000.0
+                            layout_started = time.perf_counter()
+                            im = _pack_rgb_chw(transformed)
+                            owner._phase_stats["stack_cpu_ms"] = 0.0
+                            owner._phase_stats["layout_contiguous_cpu_ms"] = (
+                                time.perf_counter() - layout_started
+                            ) * 1000.0
                         tensor_started = time.perf_counter()
                         im = torch.from_numpy(im)
                         owner._phase_stats["tensor_from_numpy_cpu_ms"] = (
@@ -332,6 +466,7 @@ class UltralyticsPersonDetector:
                     owner._phase_stats["preprocess_submit_ms"] = (
                         time.perf_counter() - wall_started
                     ) * 1000.0
+                    owner._phase_stats["model_tensor_shape"] = list(im.shape)
                     return im
 
                 setattr(
@@ -346,7 +481,8 @@ class UltralyticsPersonDetector:
                 completed = torch.cuda.Event(enable_timing=True)
                 wall_started = time.perf_counter()
                 started.record()
-                result = original(*args, **kwargs)
+                result = (owner._graph_inference(original, *args, **kwargs)
+                          if method_name == "inference" else original(*args, **kwargs))
                 completed.record()
                 owner._phase_stats[f"{method_name}_events"] = (started, completed)
                 owner._phase_stats[f"{method_name}_submit_ms"] = (
@@ -359,6 +495,48 @@ class UltralyticsPersonDetector:
         for name in ("preprocess", "inference", "postprocess"):
             wrap(name)
         self._phase_predictor_id = id(predictor)
+
+    def _graph_inference(self, original: Any, im: Any, *args: Any, **kwargs: Any) -> Any:
+        """Replay the same PyTorch kernels for a warmed, fixed input shape.
+
+        The graph owns its input/output buffers; callers transfer results before
+        the next inference. Shape changes use ordinary inference rather than
+        recapturing in the timed loop. No numeric precision conversion is added.
+        """
+        import torch
+
+        model = self._model.predictor.model
+        if (not self._config.cuda_graph_inference or getattr(model, "format", None) != "pt"
+                or not im.is_cuda or getattr(self, "_graph_disabled_reason", None)):
+            return original(im, *args, **kwargs)
+        signature = (tuple(im.shape), im.dtype, im.device)
+        state = getattr(self, "_cuda_graph_state", None)
+        if state is not None and state[0] != signature:
+            self._phase_stats["cuda_graph_shape_fallback"] = True
+            return original(im, *args, **kwargs)
+        if state is None:
+            try:
+                static_input = torch.empty_like(im)
+                static_input.copy_(im)
+                stream = torch.cuda.Stream(device=im.device)
+                stream.wait_stream(torch.cuda.current_stream(im.device))
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        original(static_input, *args, **kwargs)
+                torch.cuda.current_stream(im.device).wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    static_output = original(static_input, *args, **kwargs)
+                state = signature, graph, static_input, static_output
+                self._cuda_graph_state = state
+            except RuntimeError as exc:
+                self._graph_disabled_reason = str(exc)
+                LOGGER.warning("CUDA graph unavailable; using ordinary GPU inference: %s", exc)
+                return original(im, *args, **kwargs)
+        state[2].copy_(im)
+        state[1].replay()
+        self._phase_stats["cuda_graph_replayed"] = True
+        return state[3]
 
     def _finalize_worker_stats(self) -> dict[str, Any]:
         self._ensure_worker_state()
@@ -385,8 +563,12 @@ class UltralyticsPersonDetector:
             "stack_cpu_ms",
             "layout_contiguous_cpu_ms",
             "tensor_from_numpy_cpu_ms",
+            "model_tensor_shape",
+            "cuda_graph_replayed",
+            "cuda_graph_shape_fallback",
         ):
             stats[field] = self._phase_stats.get(field)
+        stats["cuda_graph_disabled_reason"] = getattr(self, "_graph_disabled_reason", None)
         return stats
 
     def warmup(
@@ -421,7 +603,8 @@ class UltralyticsPersonDetector:
         return dict(self._last_inference_stats)
 
     def _predict(
-        self, frames: list[NDArray[np.uint8]], imgsz: int | None = None
+        self, frames: list[NDArray[np.uint8]], imgsz: int | None = None,
+        *, preprocessed: NDArray[np.uint8] | None = None,
     ) -> list[list[Detection]]:
         if not frames:
             self._last_inference_stats = {
@@ -439,7 +622,7 @@ class UltralyticsPersonDetector:
         self._phase_stats = {}
         prediction_options: dict[str, Any] = {
             "source": frames,
-            "imgsz": imgsz if imgsz is not None else self._config.imgsz,
+            "imgsz": self._config.input_shape or (imgsz if imgsz is not None else self._config.imgsz),
             "conf": self._config.confidence,
             "iou": self._config.iou,
             "max_det": self._config.max_det,
@@ -447,14 +630,20 @@ class UltralyticsPersonDetector:
             "device": self._device,
             "verbose": False,
         }
+        if self._config.input_shape is not None:
+            prediction_options["rect"] = False
         if self._config.precision == "fp16":
             # Ultralytics 8.4.116 maps the legacy half=True alias to this
             # unified precision option and emits one warning per model call.
             prediction_options["quantize"] = 16
         prediction_started = time.perf_counter()
         without_stage_sync = self._worker_mode == "no_sync_profile"
-        with _ultralytics_profile_mode(synchronize_stages=not without_stage_sync):
-            results = self._model.predict(**prediction_options)
+        self._pending_preprocess = preprocessed
+        try:
+            with _ultralytics_profile_mode(synchronize_stages=not without_stage_sync):
+                results = self._model.predict(**prediction_options)
+        finally:
+            self._pending_preprocess = None
         # Ultralytics creates its predictor lazily during the first warmup.
         self._configure_phase_events()
         prediction_ms = (time.perf_counter() - prediction_started) * 1000
@@ -623,6 +812,8 @@ class UltralyticsPersonDetector:
         return tuple((x1, y1, x2, y2) for y1, y2 in y_ranges for x1, x2 in x_ranges)
 
     def reference_image_count(self, frame_width: int, frame_height: int) -> int:
+        if self._config.perspective_regions.enabled:
+            return len(self._perspective_layout(frame_width, frame_height))
         if not self._config.tiled_inference:
             return 1
         return len(self.tile_regions(frame_width, frame_height)) + int(
@@ -678,218 +869,69 @@ class UltralyticsPersonDetector:
         self._last_inference_stats["tile_prepare_ms"] = tile_prepare_ms
         return merged
 
-    def _detect_perspective(self, frame: NDArray[np.uint8]) -> list[Detection]:
+    def _perspective_layout(self, width: int, height: int) -> list[_PerspectiveCrop]:
+        policy = self._config.perspective_regions
+        layout: list[_PerspectiveCrop] = []
+        if policy.strategy == "full_frame_plus_far":
+            layout.append(_PerspectiveCrop(
+                (0, 0, width, height), "full", (self._config.imgsz, False, 1.0, None),
+            ))
+        names = ("far",) if policy.strategy == "full_frame_plus_far" else ("far", "middle", "near")
+        for name in names:
+            region = getattr(policy, name)
+            y1, y2 = int(region.y_min * height), int(region.y_max * height)
+            if y1 >= y2:
+                continue
+            group = (region.imgsz, region.upscale.enabled,
+                     region.upscale.scale, region.upscale.interpolation)
+            for top, bottom in _tile_ranges(y2 - y1, region.tiles.rows, region.tiles.overlap):
+                for left, right in _tile_ranges(width, region.tiles.cols, region.tiles.overlap):
+                    layout.append(_PerspectiveCrop((left, y1 + top, right, y1 + bottom), name, group))
+        return layout
+
+    def _prepare_perspective_frame(self, frame: NDArray[np.uint8]) -> tuple[list, list]:
         import cv2
-        import time
-        from backend.app.schemas import Detection
 
-        preprocess_started = time.perf_counter()
         height, width = frame.shape[:2]
+        inputs, metadata = [], []
+        for crop in self._perspective_layout(width, height):
+            left, top, right, bottom = crop.bounds
+            image = frame[top:bottom, left:right]
+            if crop.group[1]:
+                scale = crop.group[2]
+                interpolation = {"linear": cv2.INTER_LINEAR, "cubic": cv2.INTER_CUBIC,
+                                 "lanczos": cv2.INTER_LANCZOS4}[crop.group[3]]
+                image = cv2.resize(image, (max(1, int((right - left) * scale)),
+                                          max(1, int((bottom - top) * scale))),
+                                   interpolation=interpolation)
+            # Integer resize dimensions can differ from the requested factor.
+            # Map each axis with its actual scale to avoid subpixel box drift.
+            crop = _PerspectiveCrop(crop.bounds, crop.region, crop.group,
+                                    image.shape[1] / (right - left),
+                                    image.shape[0] / (bottom - top))
+            inputs.append(image)
+            metadata.append(crop)
+        return inputs, metadata
 
-        groups = {}
-        strategy = self._config.perspective_regions.strategy
+    def _detect_perspective(self, frame: NDArray[np.uint8]) -> list[Detection]:
+        return self.detect_batch([frame])[0]
 
-        counts = {"full": 0, "far": 0, "middle": 0, "near": 0}
-
-        if strategy == "full_frame_plus_far":
-            group_key = (self._config.imgsz, False, 1.0, None)
-            groups.setdefault(group_key, []).append(frame)
-            groups.setdefault(group_key + ("metadata",), []).append(
-                (0, 0, width, height, True, "full")
-            )
-            counts["full"] += 1
-
-            far = self._config.perspective_regions.far
-            y1 = int(far.y_min * height)
-            y2 = int(far.y_max * height)
-            if y1 < y2:
-                crop = frame[y1:y2, 0:width]
-                tiles = _tile_ranges(width, far.tiles.cols, far.tiles.overlap)
-                far_group_key = (
-                    far.imgsz,
-                    far.upscale.enabled,
-                    far.upscale.scale,
-                    far.upscale.interpolation,
-                )
-
-                for tx1, tx2 in tiles:
-                    tile_crop = crop[:, tx1:tx2]
-                    if far.upscale.enabled:
-                        interp = {
-                            "linear": cv2.INTER_LINEAR,
-                            "cubic": cv2.INTER_CUBIC,
-                            "lanczos": cv2.INTER_LANCZOS4,
-                        }[far.upscale.interpolation]
-                        new_w = int(tile_crop.shape[1] * far.upscale.scale)
-                        new_h = int(tile_crop.shape[0] * far.upscale.scale)
-                        tile_crop = cv2.resize(tile_crop, (new_w, new_h), interpolation=interp)
-                    groups.setdefault(far_group_key, []).append(tile_crop)
-                    groups.setdefault(far_group_key + ("metadata",), []).append(
-                        (tx1, y1, tx2 - tx1, y2 - y1, False, "far")
-                    )
-                    counts["far"] += 1
-        elif strategy == "region_only":
-            for region_name in ["far", "middle", "near"]:
-                region = getattr(self._config.perspective_regions, region_name)
-                y1 = int(region.y_min * height)
-                y2 = int(region.y_max * height)
-                if y1 >= y2:
-                    continue
-                crop = frame[y1:y2, 0:width]
-
-                y_tiles = _tile_ranges(y2 - y1, region.tiles.rows, region.tiles.overlap)
-                x_tiles = _tile_ranges(width, region.tiles.cols, region.tiles.overlap)
-
-                group_key = (
-                    region.imgsz,
-                    region.upscale.enabled,
-                    region.upscale.scale,
-                    region.upscale.interpolation,
-                )
-
-                for ty1, ty2 in y_tiles:
-                    for tx1, tx2 in x_tiles:
-                        tile_crop = crop[ty1:ty2, tx1:tx2]
-                        if region.upscale.enabled:
-                            interp = {
-                                "linear": cv2.INTER_LINEAR,
-                                "cubic": cv2.INTER_CUBIC,
-                                "lanczos": cv2.INTER_LANCZOS4,
-                            }[region.upscale.interpolation]
-                            new_w = int(tile_crop.shape[1] * region.upscale.scale)
-                            new_h = int(tile_crop.shape[0] * region.upscale.scale)
-                            tile_crop = cv2.resize(tile_crop, (new_w, new_h), interpolation=interp)
-                        groups.setdefault(group_key, []).append(tile_crop)
-                        groups.setdefault(group_key + ("metadata",), []).append(
-                            (tx1, y1 + ty1, tx2 - tx1, ty2 - ty1, False, region_name)
-                        )
-                        counts[region_name] += 1
-
-        preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
-        detector_started = time.perf_counter()
-
-        all_candidates: list[Detection] = []
-        all_candidate_sources: list[int] = []
-        source_id_counter = 0
-
-        stats = {
-            "model_invocations": 0,
-            "inference_images": 0,
-            "model_predict_ms": 0.0,
-            "result_transfer_ms": 0.0,
-        }
-
-        raw_detections = {"full": 0, "far": 0, "middle": 0, "near": 0}
-
-        for key, inputs in groups.items():
-            if len(key) > 4:
-                continue
-            imgsz, upscale_enabled, scale_factor, interpolation = key
-            metadata_list = groups[key + ("metadata",)]
-
-            prediction_batches = self._predict(inputs, imgsz=imgsz)
-            stats["model_invocations"] += self._last_inference_stats.get("model_invocations", 0)
-            stats["inference_images"] += self._last_inference_stats.get("inference_images", 0)
-            stats["model_predict_ms"] += self._last_inference_stats.get("model_predict_ms", 0.0)
-            stats["result_transfer_ms"] += self._last_inference_stats.get("result_transfer_ms", 0.0)
-
-            for batch, meta in zip(prediction_batches, metadata_list):
-                x1_offset, y1_offset, orig_w, orig_h, is_full, region_name = meta
-
-                raw_detections[region_name] += len(batch)
-
-                for det in batch:
-                    det_x1, det_y1, det_x2, det_y2 = det.x1, det.y1, det.x2, det.y2
-                    if upscale_enabled:
-                        det_x1 /= scale_factor
-                        det_y1 /= scale_factor
-                        det_x2 /= scale_factor
-                        det_y2 /= scale_factor
-
-                    if not is_full:
-                        if not self._keep_tile_detection(
-                            Detection(
-                                x1=det_x1,
-                                y1=det_y1,
-                                x2=det_x2,
-                                y2=det_y2,
-                                confidence=det.confidence,
-                                class_id=det.class_id,
-                            ),
-                            tile_width=orig_w,
-                            tile_height=orig_h,
-                            left_internal=x1_offset > 0,
-                            top_internal=y1_offset > 0,
-                            right_internal=(x1_offset + orig_w) < width,
-                            bottom_internal=(y1_offset + orig_h) < height,
-                            edge_min_confidence=self._config.tile_edge_min_confidence,
-                        ):
-                            continue
-
-                    all_candidates.append(
-                        Detection(
-                            x1=det_x1 + x1_offset,
-                            y1=det_y1 + y1_offset,
-                            x2=det_x2 + x1_offset,
-                            y2=det_y2 + y1_offset,
-                            confidence=det.confidence,
-                            class_id=det.class_id,
-                        )
-                    )
-                    all_candidate_sources.append(source_id_counter)
-                source_id_counter += 1
-
-        detector_ms = (time.perf_counter() - detector_started) * 1000
-        merge_started = time.perf_counter()
-
-        filtered: list[Detection] = []
-        filtered_sources: list[int] = []
-        for det, src_id in zip(all_candidates, all_candidate_sources):
-            if _in_ignore_region(
-                det, width=width, height=height, regions=self._config.ignore_regions
-            ):
-                continue
-            filtered.append(det)
-            filtered_sources.append(src_id)
-
-        merged = _merge_detections(
-            filtered,
-            iou_threshold=self._config.tile_merge_iou,
-            max_detections=self._config.max_det,
-            source_ids=filtered_sources,
-        )
-
-        merge_ms = (time.perf_counter() - merge_started) * 1000
-
-        stats["merge_ms"] = merge_ms
-        stats["postprocess_ms"] = stats["result_transfer_ms"] + merge_ms
-
-        # Additional metrics
-        stats["detector_images_total"] = stats["inference_images"]
-        stats["detector_images_far"] = counts["far"]
-        stats["detector_images_middle"] = counts["middle"]
-        stats["detector_images_near"] = counts["near"]
-        stats["detector_images_full"] = counts["full"]
-
-        stats["detections_far_raw"] = raw_detections["far"]
-        stats["detections_middle_raw"] = raw_detections["middle"]
-        stats["detections_near_raw"] = raw_detections["near"]
-        stats["detections_after_merge"] = len(merged)
-
-        stats["perspective_preprocess_ms"] = preprocess_ms
-        stats["perspective_detector_ms"] = detector_ms
-        stats["perspective_merge_ms"] = merge_ms
-
-        # Re-populate self._last_inference_stats with the accumulated values
-        self._last_inference_stats = stats
-
-        return merged
+    @staticmethod
+    def prepared_frame_workload(predictions: Sequence[list[Detection]],
+                                metadata: Sequence[CropMetadata]) -> dict[str, int]:
+        stats = {"detector_images_total": len(metadata)}
+        for name in ("full", "far", "middle", "near"):
+            indices = [i for i, crop in enumerate(metadata)
+                       if isinstance(crop, _PerspectiveCrop) and crop.region == name]
+            stats[f"detector_images_{name}"] = len(indices)
+            stats[f"detections_{name}_raw"] = sum(len(predictions[i]) for i in indices)
+        return stats
 
     def detect_batch(
         self,
         frames: Sequence[NDArray[np.uint8]],
     ) -> list[list[Detection]]:
-        """Detect an ordered batch of independent source frames in one model call.
+        """Detect an ordered batch, grouping perspective crops by resolution.
 
         Tile predictions are still merged independently per source frame, so a
         box can never suppress a box belonging to another frame.  Callers must
@@ -899,6 +941,29 @@ class UltralyticsPersonDetector:
         if not source_frames:
             self._predict([])
             return []
+        if self._config.perspective_regions.enabled:
+            inputs, metadata, prepare_ms = self.prepare_source_batch(source_frames)
+            predictions, stats = self.infer_prepared_batch(inputs)
+            outputs, offset, total_merge_ms = [], 0, 0.0
+            workload: dict[str, int] = {}
+            for frame, crops in zip(source_frames, metadata, strict=True):
+                frame_predictions = predictions[offset:offset + len(crops)]
+                merged, merge_ms = self.merge_prepared_frame(frame, frame_predictions, crops)
+                for key, value in self.prepared_frame_workload(frame_predictions, crops).items():
+                    workload[key] = workload.get(key, 0) + value
+                outputs.append(merged)
+                total_merge_ms += merge_ms
+                offset += len(crops)
+            stats.update(workload)
+            stats.update(merge_ms=total_merge_ms, tile_prepare_ms=prepare_ms,
+                         perspective_preprocess_ms=prepare_ms,
+                         perspective_detector_ms=stats.get("model_predict_ms", 0.0),
+                         perspective_merge_ms=total_merge_ms,
+                         source_batch_size=len(source_frames),
+                         detections_after_merge=sum(map(len, outputs)),
+                         postprocess_ms=float(stats.get("result_transfer_ms") or 0.0) + total_merge_ms)
+            self._last_inference_stats = stats
+            return outputs
         if not self._config.tiled_inference:
             predictions = self._predict(source_frames)
             outputs: list[list[Detection]] = []
@@ -920,10 +985,10 @@ class UltralyticsPersonDetector:
 
         tile_prepare_started = time.perf_counter()
         flat_inputs: list[NDArray[np.uint8]] = []
-        frame_metadata: list[list[tuple[int, int, int, int] | None]] = []
+        frame_metadata: list[list[CropMetadata]] = []
         for frame in source_frames:
             height, width = frame.shape[:2]
-            metadata: list[tuple[int, int, int, int] | None] = []
+            metadata: list[CropMetadata] = []
             if self._config.tile_include_full_frame:
                 flat_inputs.append(frame)
                 metadata.append(None)
@@ -961,17 +1026,22 @@ class UltralyticsPersonDetector:
         frames: Sequence[NDArray[np.uint8]],
     ) -> tuple[
         list[NDArray[np.uint8]],
-        list[list[tuple[int, int, int, int] | None]],
+        list[list[CropMetadata]],
         float,
     ]:
         """Prepare an ordered offline batch without invoking the model."""
         started = time.perf_counter()
-        flat_inputs: list[NDArray[np.uint8]] = []
-        frame_metadata: list[list[tuple[int, int, int, int] | None]] = []
+        flat_inputs = _PreparedInputs()
+        frame_metadata: list[list[CropMetadata]] = []
         for frame in frames:
             height, width = frame.shape[:2]
             metadata: list[tuple[int, int, int, int] | None] = []
-            if not self._config.tiled_inference:
+            if self._config.perspective_regions.enabled:
+                crops, metadata = self._prepare_perspective_frame(frame)
+                for image, crop in zip(crops, metadata, strict=True):
+                    flat_inputs.groups.setdefault(crop.group, []).append(len(flat_inputs))
+                    flat_inputs.append(image)
+            elif not self._config.tiled_inference:
                 flat_inputs.append(frame)
                 metadata.append(None)
             else:
@@ -982,6 +1052,23 @@ class UltralyticsPersonDetector:
                     flat_inputs.append(frame[y1:y2, x1:x2])
                     metadata.append((x1, y1, x2, y2))
             frame_metadata.append(metadata)
+        if (self._config.offline_cpu_preprocess and flat_inputs
+                and not flat_inputs.groups and self._worker_mode == "no_sync_profile"):
+            # The bounded producer queue owns this array. The GPU worker only
+            # transfers it; original BGR crops remain available for box scaling.
+            from ultralytics.data.augment import LetterBox
+
+            target = self._config.input_shape or (self._config.imgsz, self._config.imgsz)
+            target = tuple(int(np.ceil(side / 32)) * 32 for side in target)
+            predictor = getattr(getattr(self, "_model", None), "predictor", None)
+            model = getattr(predictor, "model", None)
+            same_shapes = len({image.shape for image in flat_inputs}) == 1
+            auto = (same_shapes and self._config.input_shape is None
+                    and (getattr(model, "format", None) == "pt"
+                         or getattr(model, "dynamic", False)))
+            stride = getattr(model, "stride", 32)
+            letterbox = LetterBox(target, auto=auto, stride=stride)
+            flat_inputs.preprocessed = _pack_rgb_chw([letterbox(image=image) for image in flat_inputs])
         return flat_inputs, frame_metadata, (time.perf_counter() - started) * 1000
 
     def infer_prepared_batch(
@@ -989,14 +1076,43 @@ class UltralyticsPersonDetector:
         inputs: Sequence[NDArray[np.uint8]],
     ) -> tuple[list[list[Detection]], dict[str, Any]]:
         """Infer one prepared batch and snapshot GPU-worker-owned stats."""
-        predictions = self._predict(list(inputs))
+        self._ensure_worker_state()
+        groups = getattr(inputs, "groups", {})
+        if groups:
+            predictions: list[list[Detection]] = [[] for _ in inputs]
+            stats: dict[str, Any] = {"model_invocations": 0, "inference_images": 0}
+            totals = ("model_predict_ms", "ultralytics_predict_ms", "result_transfer_ms",
+                      "yolo_preprocess_total_ms", "yolo_inference_total_ms", "yolo_postprocess_total_ms",
+                      "event_h2d_total_ms", "event_tensor_conversion_total_ms",
+                      "pre_transform_cpu_ms", "stack_cpu_ms", "layout_contiguous_cpu_ms",
+                      "tensor_from_numpy_cpu_ms")
+            for group, indices in groups.items():
+                batches = self._predict([inputs[i] for i in indices], imgsz=group[0])
+                for index, batch in zip(indices, batches, strict=True):
+                    predictions[index] = batch
+                measured = self.last_inference_stats
+                for key in ("model_invocations", "inference_images", *totals):
+                    value = measured.get(key)
+                    if value is not None:
+                        stats[key] = stats.get(key, 0) + value
+            stats.update(batch_size=max(map(len, groups.values())),
+                         actual_tensor_shapes=[list(image.shape) for image in inputs],
+                         sum_tensor_pixels=sum(image.shape[0] * image.shape[1] for image in inputs),
+                         worker_mode=self._worker_mode,
+                         shape_source="source_images_before_ultralytics_letterbox",
+                         workload_source="measured_input_shapes")
+            self._last_inference_stats = stats
+            return predictions, dict(stats)
+        preprocessed = getattr(inputs, "preprocessed", None)
+        predictions = (self._predict(list(inputs), preprocessed=preprocessed)
+                       if preprocessed is not None else self._predict(list(inputs)))
         return predictions, self.last_inference_stats
 
     def merge_prepared_frame(
         self,
         frame: NDArray[np.uint8],
         prediction_batches: Sequence[list[Detection]],
-        metadata: Sequence[tuple[int, int, int, int] | None],
+        metadata: Sequence[CropMetadata],
     ) -> tuple[list[Detection], float]:
         """Merge one frame without mutating stats owned by the GPU worker."""
         return self._merge_prediction_results_timed(frame, prediction_batches, metadata)
@@ -1038,7 +1154,7 @@ class UltralyticsPersonDetector:
         self,
         frame: NDArray[np.uint8],
         prediction_batches: Sequence[list[Detection]],
-        metadata: Sequence[tuple[int, int, int, int] | None],
+        metadata: Sequence[CropMetadata],
     ) -> tuple[list[Detection], float]:
         height, width = frame.shape[:2]
         merge_started = time.perf_counter()
@@ -1052,10 +1168,17 @@ class UltralyticsPersonDetector:
                 candidates.extend(tile_detections)
                 candidate_sources.extend([source_id] * len(tile_detections))
                 continue
-            tile_x1, tile_y1, tile_x2, tile_y2 = tile
+            perspective = tile if isinstance(tile, _PerspectiveCrop) else None
+            tile_x1, tile_y1, tile_x2, tile_y2 = perspective.bounds if perspective else tile
             tile_width = tile_x2 - tile_x1
             tile_height = tile_y2 - tile_y1
             for detection in tile_detections:
+                if perspective is not None:
+                    detection = Detection(
+                        detection.x1 / perspective.scale_x, detection.y1 / perspective.scale_y,
+                        detection.x2 / perspective.scale_x, detection.y2 / perspective.scale_y,
+                        detection.confidence, detection.class_id,
+                    )
                 # Do not discard edge-touching tile results.  A small or
                 # occluded pedestrian can genuinely be clipped by a tile. Keep
                 # strong edge evidence and let the source-aware merge remove
@@ -1108,7 +1231,7 @@ class UltralyticsPersonDetector:
         self,
         frame: NDArray[np.uint8],
         prediction_batches: Sequence[list[Detection]],
-        metadata: Sequence[tuple[int, int, int, int] | None],
+        metadata: Sequence[CropMetadata],
     ) -> list[Detection]:
         merged, merge_ms = self._merge_prediction_results_timed(frame, prediction_batches, metadata)
         self._last_inference_stats["merge_ms"] = merge_ms

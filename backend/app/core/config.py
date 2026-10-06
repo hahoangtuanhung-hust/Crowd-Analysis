@@ -55,6 +55,11 @@ class DetectorConfig(StrictModel):
     classes: list[int] = Field(default_factory=lambda: [0])
     device: str = "auto"
     precision: Literal["fp32", "fp16"] = "fp32"
+    # Optional fixed (height, width) letterbox canvas. Keep all source crops;
+    # change padding only when the camera-specific profile has been validated.
+    input_shape: tuple[int, int] | None = None
+    offline_cpu_preprocess: bool = False
+    cuda_graph_inference: bool = False
     tiled_inference: bool = False
     tile_rows: int = Field(default=2, ge=1, le=4)
     tile_columns: int = Field(default=2, ge=1, le=4)
@@ -76,6 +81,11 @@ class DetectorConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_normalized_regions(self) -> DetectorConfig:
+        if self.input_shape is not None:
+            if any(side < 32 or side % 32 for side in self.input_shape):
+                raise ValueError("detector input_shape sides must be positive multiples of 32")
+            if self.perspective_regions.enabled:
+                raise ValueError("input_shape cannot override perspective region resolutions")
         for field_name, regions in (
             ("tile_regions_normalized", self.tile_regions_normalized),
             ("ignore_regions", self.ignore_regions),
@@ -589,6 +599,9 @@ class AppConfig(StrictModel):
                 "otherwise ByteTrack cannot use its low-confidence recovery stage"
             )
         if self.motion_roi.enabled or self.motion_roi.shadow_mode:
+            if self.detector.perspective_regions.enabled:
+                raise ValueError("motion_roi cannot combine with perspective_regions; "
+                                 "its coverage plan uses the uniform detector tile geometry")
             if not self.detector.tiled_inference:
                 raise ValueError(
                     "motion_roi requires detector.tiled_inference so ROI execution "

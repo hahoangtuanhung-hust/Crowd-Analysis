@@ -152,13 +152,18 @@ class ByteTrackTracker:
     ) -> NDArray[np.float32]:
         from ultralytics.trackers.utils import matching
 
-        iou_cost = np.asarray(matching.iou_distance(tracks, detections), dtype=np.float32)
-        cost = iou_cost.copy()
-        if self._config.association_mode == "hybrid" and tracks and detections:
-            # Ultralytics computes xyxy from Kalman state on every property
-            # access. Snapshot each box once for all project-specific geometry.
+        hybrid = self._config.association_mode == "hybrid" and tracks and detections
+        if hybrid:
+            # Share one Kalman-box snapshot between IoU and motion geometry.
             track_boxes = [item.xyxy for item in tracks]
             detection_boxes = [item.xyxy for item in detections]
+            iou_cost = np.asarray(matching.iou_distance(track_boxes, detection_boxes), dtype=np.float32)
+        else:
+            iou_cost = np.asarray(matching.iou_distance(tracks, detections), dtype=np.float32)
+        cost = iou_cost.copy()
+        if hybrid:
+            # Ultralytics computes xyxy from Kalman state on every property
+            # access. Snapshot each box once for all project-specific geometry.
             track_points = np.asarray(
                 [self._bottom_center(box) for box in track_boxes],
                 dtype=np.float32,
